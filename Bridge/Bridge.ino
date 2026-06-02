@@ -1,5 +1,6 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <nvs_flash.h>  // Added for full NVS wipe
@@ -77,6 +78,19 @@ void configureBLE();
 void deinitBLE();
 static bool bleShouldAdvertise();
 static void updateBleAdvertising();
+static void forwardReading(const String &eui, const String &data);
+
+// --- Discovery / data-forwarding to the display node ---
+// The cloud discovery server address is fixed infrastructure baked into the
+// firmware (same for every unit, so it survives gateway failover). It can be
+// overridden per-site by a "disc" field in the PROVISION payload (stored NVS).
+#define DEFAULT_DISCOVERY_URL "http://10.14.98.109:8000"   // <-- set to your discovery server
+static String   g_discoveryUrl = DEFAULT_DISCOVERY_URL;
+static String   g_nodeUrl      = "";                        // discovered display node e.g. http://192.168.1.60:8001
+static uint32_t g_lastDiscover = 0;
+static uint32_t g_lastBeat     = 0;
+static const uint32_t DISCOVER_INTERVAL_MS = 10000;
+static const uint32_t BEAT_INTERVAL_MS     = 10000;
 
 // Pending command tracking
 static bool g_pendingAdd = false;
@@ -124,6 +138,7 @@ void handleProvisioning(const String &jsonPayload) {
   const char *pass = doc["pass"];
   const char *zone = doc["zone"];
   const char *netName = doc["netName"];
+  const char *disc = doc["disc"];        // optional: discovery server URL override
 
   if (!ssid || !pass || !netName) {
     bleNotifyLine("ERR MISSING_FIELDS");
@@ -138,6 +153,10 @@ void handleProvisioning(const String &jsonPayload) {
   preferences.putString("pass", pass);
   preferences.putString("zone", zone ? zone : "Default");
   preferences.putString("net", netName);
+  if (disc && strlen(disc) > 0) {
+    preferences.putString("disc", disc);
+    g_discoveryUrl = disc;
+  }
   preferences.end();
 
   // 2. Connect to Wi-Fi (drop any prior association first so switching to a
@@ -277,6 +296,84 @@ static void handleGatewayRole(const String &role) {
   }
 }
 
+// --- Discovery: ask the discovery server for the display node's LAN ip ---
+static void discoverNode() {
+  if (g_discoveryUrl.isEmpty()) return;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
+  if (!http.begin(g_discoveryUrl + "/discover")) return;
+  int code = http.GET();
+  if (code == 200) {
+    DynamicJsonDocument doc(1024);
+    if (!deserializeJson(doc, http.getString())) {
+      JsonArray fwd = doc["forwarders"].as<JsonArray>();
+      if (fwd.size() > 0) {
+        String ip = fwd[0]["local_ip"] | "";
+        int port = fwd[0]["port"] | 8001;
+        if (ip.length()) {
+          String nu = "http://" + ip + ":" + String(port);
+          if (nu != g_nodeUrl) { g_nodeUrl = nu; Serial.printf("[DISC] display node -> %s\n", g_nodeUrl.c_str()); }
+        }
+      } else {
+        Serial.println("[DISC] no display node registered yet (run display_node.py)");
+      }
+    }
+  } else {
+    Serial.printf("[DISC] /discover failed (HTTP %d) @ %s\n", code, g_discoveryUrl.c_str());
+  }
+  http.end();
+}
+
+// --- Presence heartbeat: tells the discovery server the site has internet ---
+static void heartbeatPresence() {
+  if (g_discoveryUrl.isEmpty()) return;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
+  if (!http.begin(g_discoveryUrl + "/register/sensor")) return;
+  http.addHeader("Content-Type", "application/json");
+  char id[24];
+  snprintf(id, sizeof(id), "gateway-%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+  String body = String("{\"sensor_id\":\"") + id + "\",\"meta\":{\"role\":\"gateway\"}}";
+  http.POST(body);
+  http.end();
+}
+
+// --- Forward one sensor reading to the display node (P2P on the LAN) ---
+static void forwardReading(const String &eui, const String &data) {
+  if (g_nodeUrl.isEmpty()) return;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
+  if (!http.begin(g_nodeUrl + "/ingest")) return;
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{\"sensor_id\":\"") + eui + "\",\"data\":\"" + data + "\"}";
+  int code = http.POST(body);
+  http.end();
+  if (code > 0) {
+    Serial.printf("[FWD] %s -> %s/ingest (%d)\n", eui.c_str(), g_nodeUrl.c_str(), code);
+  } else {
+    Serial.printf("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
+    g_nodeUrl = "";   // node unreachable -> force a re-discover
+  }
+}
+
+// --- Register an EUI -> box/slot mapping on the display node (commissioning) ---
+static bool registerSensorMap(const String &eui, int box, const String &slot) {
+  if (g_nodeUrl.isEmpty()) discoverNode();
+  if (g_nodeUrl.isEmpty()) return false;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
+  if (!http.begin(g_nodeUrl + "/map")) return false;
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{\"eui\":\"") + eui + "\",\"box\":" + String(box) + ",\"slot\":\"" + slot + "\"}";
+  int code = http.POST(body);
+  http.end();
+  return code == 200;
+}
+
 // --- Parsing Pending Adds ---
 static void parsePendingFromCommand(const String &cmdLine) {
   String line = cmdLine;
@@ -319,12 +416,24 @@ static void handleCommissionerLine(const String &line) {
   // Forward raw logs for debug
   bleNotifyLine(line);
 
-  // --- NEW: Intercept and explicitly print thread sensor UDP data ---
+  // --- Thread sensor data relayed from the C6 ---
+  //   "[UDP_RX] From [addr]:port -> EUI=<hex>;t=23.1,24.0,err,..."
+  // Extract the sensor EUI + temps and forward to the display node /ingest.
   if (line.indexOf("[UDP_RX]") >= 0) {
-    Serial.println("\n========== THREAD SENSOR DATA ==========");
-    Serial.println(line);
-    Serial.println("========================================\n");
-    return; // Already handled
+    int arrow = line.indexOf("-> ");
+    if (arrow >= 0 && isActiveGateway) {
+      String payload = line.substring(arrow + 3);
+      payload.trim();                                   // "EUI=<hex>;t=..."
+      if (payload.startsWith("EUI=")) {
+        int semi = payload.indexOf(';');
+        if (semi > 4) {
+          String eui  = payload.substring(4, semi);
+          String data = payload.substring(semi + 1);    // "t=23.1,24.0,..."
+          forwardReading(eui, data);
+        }
+      }
+    }
+    return; // handled
   }
 
   // 1. Check for Network Formation
@@ -532,6 +641,28 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
+    // A2. MAP — assign a sensor's EUI to a physical box/slot at commissioning.
+    //     Format: "MAP|<EUI16hex>|<box>|<slot>"  e.g. "MAP|58e6c5fffe164ec0|3|A"
+    //     Forwarded to the display node (the central EUI->box/slot table).
+    if (cmdLine.startsWith("MAP|")) {
+      int p1 = cmdLine.indexOf('|');
+      int p2 = cmdLine.indexOf('|', p1 + 1);
+      int p3 = cmdLine.indexOf('|', p2 + 1);
+      if (p1 > 0 && p2 > p1 && p3 > p2) {
+        String eui  = cmdLine.substring(p1 + 1, p2);
+        int    box  = cmdLine.substring(p2 + 1, p3).toInt();
+        String slot = cmdLine.substring(p3 + 1);
+        eui.toLowerCase();
+        slot.toUpperCase();
+        bool ok = registerSensorMap(eui, box, slot);
+        bleNotifyLine(ok ? "ACK MAP " + eui : "ERR MAP NODE_UNREACHABLE");
+        Serial.printf("[MAP] %s -> box%d-%s (%s)\n", eui.c_str(), box, slot.c_str(), ok ? "ok" : "failed");
+      } else {
+        bleNotifyLine("ERR MAP FORMAT");
+      }
+      return;
+    }
+
     // B. ADD (Busy Check)
     if (g_pendingAdd && cmdLine.startsWith("add ")) {
       Serial.println("[BLE] Rejecting add: Busy");
@@ -647,7 +778,10 @@ void setup() {
   preferences.begin("gateway_config", true);
   String savedSSID = preferences.getString("ssid", "");
   String savedPass = preferences.getString("pass", "");
+  String savedDisc = preferences.getString("disc", "");
   preferences.end();
+  if (savedDisc.length() > 0) g_discoveryUrl = savedDisc;
+  Serial.printf("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
 
   if (savedSSID.length() > 0) {
     // Do NOT auto-connect here. Wi-Fi is brought up only when the C6 signals
@@ -753,6 +887,20 @@ void loop() {
     Serial.println("[GW] STANDBY confirmed — dropping Wi-Fi + management BLE (no longer the gateway).");
     WiFi.disconnect(true);
     updateBleAdvertising();   // stop advertising; this unit is now a plain router
+  }
+
+  // 2c. Active gateway: keep the display-node endpoint fresh and heartbeat the
+  //     discovery server (presence == site has internet).
+  if (isActiveGateway) {
+    uint32_t now = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) { g_lastDiscover = now; discoverNode(); }
+      if (now - g_lastBeat     >= BEAT_INTERVAL_MS)     { g_lastBeat = now;     heartbeatPresence(); }
+    } else if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) {
+      g_lastDiscover = now;
+      Serial.printf("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
+                    WiFi.status());
+    }
   }
 
   // 3. Pending Timeout Check (Bridge failsafe)

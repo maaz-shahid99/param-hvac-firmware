@@ -26,6 +26,10 @@ DallasTemperature ds18b20(&oneWire);
 // Your secure passphrase
 const char *pskd = "J01NME";
 
+// Factory EUI-64 (hex), used to tag every UDP payload so the gateway/host can
+// map this physical sensor to its rack box/slot. Set once in setup().
+char g_eui[17] = "0000000000000000";
+
 // Global state flags
 volatile bool g_joined = false;
 volatile bool g_failed = false;
@@ -90,8 +94,17 @@ void setup() {
       Serial.println("[SYSTEM] NVS Partition mounted successfully.");
   }
 
+  // Capture our factory EUI-64 once (hex), for tagging UDP payloads.
+  {
+    uint8_t mac8[8];
+    if (esp_read_mac(mac8, ESP_MAC_IEEE802154) == ESP_OK) {
+      for (int i = 0; i < 8; i++) sprintf(g_eui + i * 2, "%02x", mac8[i]);
+    }
+    Serial.printf("[HW] EUI-64: %s\n", g_eui);
+  }
+
   Serial.println("\n[BOOT] Starting OpenThread SED Device...");
-  OpenThread::begin(false); 
+  OpenThread::begin(false);
   delay(500); 
 
   if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
@@ -182,8 +195,10 @@ void loop() {
     // 3a. Read Sensors (This blocks for ~750ms, so we do it BEFORE locking Thread)
     ds18b20.requestTemperatures();
     
-    // Prepare a payload string formatted as a CSV list: "t=23.1,24.2,23.5..."
-    char payload[128] = "t="; 
+    // Payload tags the sensor's EUI then a CSV of probe temps:
+    //   "EUI=58e6c5fffe164ec0;t=23.1,24.2,err,..."
+    char payload[160];
+    snprintf(payload, sizeof(payload), "EUI=%s;t=", g_eui);
     char tempStr[10];
 
     for (int i = 0; i < NUM_SENSORS; i++) {
