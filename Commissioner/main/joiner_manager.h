@@ -14,3 +14,11 @@
  * * @return OT_ERROR_NONE on success, or an error code on failure.
  */
 otError joiner_add_request(const char *eui64_str, const char *pskd, uint32_t timeout);
+
+/**
+ * @brief Same as joiner_add_request() but does NOT take the OpenThread lock.
+ *
+ * The caller MUST already hold the OpenThread lock, or be running inside the
+ * OpenThread task context (e.g. a commissioner state/joiner callback).
+ */
+otError joiner_add_locked(const char *eui64_str, const char *pskd, uint32_t timeout);

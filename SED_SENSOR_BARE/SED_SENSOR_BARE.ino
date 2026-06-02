@@ -13,6 +13,16 @@
 #include "openthread/ip6.h"
 #include "openthread/dataset.h"
 
+// --- NEW: Sensor Libraries & Config ---
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define ONE_WIRE_BUS D4     // Data wire is plugged into D1
+#define NUM_SENSORS 8      // Number of DS18B20 sensors
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+
 // Your secure passphrase
 const char *pskd = "J01NME";
 
@@ -30,15 +40,13 @@ void otaJoinerCallback(otError aError, void *aContext) {
 
     Serial.println("[SYSTEM] Rebooting to apply new credentials...");
     delay(500);
-    ESP.restart(); // The easiest/safest way to transition from Joiner to normal End Device in ESP32
+    ESP.restart(); 
     
   } else if (aError == 23) {
-    // ERROR 23 = Not Found. This is normal wireless packet loss.
     Serial.println("[JOINER] Error 23: Missed the router's beacon. Will retry...");
-    g_failed = false; // Do NOT give up!
+    g_failed = false; 
     
   } else {
-    // ERROR 28 (Security) or other fatal errors
     g_failed = true;
     Serial.printf("[JOINER] FATAL: Handshake failed with Error %d. STOPPING.\n", aError);
     if (aError == 28) Serial.println("[DEBUG] Error 28 = Security Rejected. PSKD mismatch.");
@@ -50,15 +58,7 @@ static void start_joiner_locked(otInstance *inst) {
   otJoinerStop(inst);
 
   otError err = otJoinerStart(
-    inst,
-    pskd,
-    NULL,
-    "MyVendor",
-    "MySensor",
-    "1.0.0",
-    NULL,
-    otaJoinerCallback,
-    NULL);
+    inst, pskd, NULL, "MyVendor", "MySensor", "1.0.0", NULL, otaJoinerCallback, NULL);
 
   if (err != OT_ERROR_NONE) {
     Serial.printf("[JOINER] WARNING: Joiner failed to initialize! Error: %d\n", err);
@@ -68,81 +68,20 @@ static void start_joiner_locked(otInstance *inst) {
 }
 
 // --- SETUP ---
-// void setup() {
-//   Serial.begin(115200);
-//   delay(2000);
-
-//   nvs_flash_erase();
-//   esp_err_t ret = nvs_flash_init();
-//   if (ret != ESP_OK) {
-//       Serial.printf("[SYSTEM] NVS Init Failed: %s\n", esp_err_to_name(ret));
-//       nvs_flash_init(); 
-//   } else {
-//       Serial.println("[SYSTEM] NVS Partition mounted.");
-//   }
-
-//   Serial.println("\n[BOOT] Starting OpenThread SED Device...");
-//   OpenThread::begin(false); // Do not auto-start with default PAN
-//   delay(500); 
-
-//   if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
-//     Serial.println("[FATAL] Could not acquire OT lock in setup!");
-//     return;
-//   }
-
-//   otInstance *inst = esp_openthread_get_instance();
-
-//   // 2. CHECK FOR EXISTING CREDENTIALS FIRST
-//   otOperationalDataset activeDataset;
-//   if (otDatasetGetActive(inst, &activeDataset) == OT_ERROR_NONE) {
-//     Serial.printf("[SYSTEM] Found existing credentials (PAN: 0x%04X). Connecting...\n", activeDataset.mPanId);
-    
-//     otLinkModeConfig linkMode = { .mRxOnWhenIdle = 0, .mDeviceType = 0, .mNetworkData = 1 };
-//     otThreadSetLinkMode(inst, linkMode);
-
-//     otIp6SetEnabled(inst, true);
-//     otThreadSetEnabled(inst, true);
-//     g_joined = true;
-
-//   } else {
-//     Serial.println("[SYSTEM] No credentials found. Starting Joiner Process...");
-    
-//     // Read hardware MAC for logging
-//     uint8_t hardware_mac[8];
-//     if (esp_read_mac(hardware_mac, ESP_MAC_IEEE802154) == ESP_OK) {
-//       Serial.print("[HW] Factory EUI-64: ");
-//       for (int i = 0; i < 8; i++) Serial.printf("%02x", hardware_mac[i]);
-//       Serial.println();
-//     }
-
-//     // Keep radio awake during handshake
-//     otLinkModeConfig joinMode = { .mRxOnWhenIdle = 1, .mDeviceType = 0, .mNetworkData = 1 };
-//     otThreadSetLinkMode(inst, joinMode);
-
-//     otIp6SetEnabled(inst, true);
-//     otLinkSetChannel(inst, 15);
-//     otLinkSetSupportedChannelMask(inst, (1 << 15));
-
-//     start_joiner_locked(inst); 
-//   }
-
-//   esp_openthread_lock_release();
-// }
-
-// --- SETUP ---
 void setup() {
   Serial.begin(115200);
   delay(2000);
 
+  // Initialize Dallas Temperature Library
+  ds18b20.begin();
+  Serial.printf("[SENSORS] DS18B20 init. Found %d sensors.\n", ds18b20.getDeviceCount());
+
   // 1. ROBUST NVS INITIALIZATION
-  // Try to initialize NVS first without erasing
   esp_err_t ret = nvs_flash_init();
-  
-  // Only erase if there are no free pages or a new version is found
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       Serial.println("[SYSTEM] NVS partition requires formatting. Erasing...");
       nvs_flash_erase();
-      ret = nvs_flash_init(); // Retry init after erase
+      ret = nvs_flash_init(); 
   }
   
   if (ret != ESP_OK) {
@@ -152,7 +91,7 @@ void setup() {
   }
 
   Serial.println("\n[BOOT] Starting OpenThread SED Device...");
-  OpenThread::begin(false); // Do not auto-start with default PAN
+  OpenThread::begin(false); 
   delay(500); 
 
   if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
@@ -177,7 +116,6 @@ void setup() {
   } else {
     Serial.println("[SYSTEM] No credentials found. Starting Joiner Process...");
     
-    // Read hardware MAC for logging
     uint8_t hardware_mac[8];
     if (esp_read_mac(hardware_mac, ESP_MAC_IEEE802154) == ESP_OK) {
       Serial.print("[HW] Factory EUI-64: ");
@@ -185,7 +123,6 @@ void setup() {
       Serial.println();
     }
 
-    // Keep radio awake during handshake
     otLinkModeConfig joinMode = { .mRxOnWhenIdle = 1, .mDeviceType = 0, .mNetworkData = 1 };
     otThreadSetLinkMode(inst, joinMode);
 
@@ -208,7 +145,6 @@ void loop() {
       otInstance *inst = esp_openthread_get_instance();
       otJoinerState state = otJoinerGetState(inst);
 
-      // Radar every 2 seconds
       static uint32_t radar_timer = 0;
       if (millis() - radar_timer > 2000) {
         radar_timer = millis();
@@ -218,7 +154,6 @@ void loop() {
                       otLinkGetChannel(inst), otLinkGetPanId(inst));
       }
 
-      // Smart Retry: Only if idle (e.g. Error 23 timeout) and 5 seconds have passed
       static uint32_t retry_timer = 0;
       if (state == OT_JOINER_STATE_IDLE && millis() - retry_timer > 5000) {
         retry_timer = millis();
@@ -238,44 +173,71 @@ void loop() {
       }
   }
 
-  // --- 3. UDP TX AFTER JOIN ---
-  if (g_joined && esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
-    otInstance *inst = esp_openthread_get_instance();
-    static uint32_t last = 0;
-    otDeviceRole currentRole = otThreadGetDeviceRole(inst);
+  // --- 3. SENSOR READING & UDP TX AFTER JOIN ---
+  static uint32_t last = 0;
+  
+  // We check the timer OUTSIDE the lock. 
+  if (g_joined && (millis() - last > 10000)) {
+    
+    // 3a. Read Sensors (This blocks for ~750ms, so we do it BEFORE locking Thread)
+    ds18b20.requestTemperatures();
+    
+    // Prepare a payload string formatted as a CSV list: "t=23.1,24.2,23.5..."
+    char payload[128] = "t="; 
+    char tempStr[10];
 
-    // Only send data if we are successfully attached to the mesh as a CHILD
-    if (currentRole == OT_DEVICE_ROLE_CHILD && millis() - last > 10000) {
-      last = millis();
-
-      otMessage *msg = otUdpNewMessage(inst, NULL);
-      if (msg != NULL) {
-        const char *p = "temp=23";
-        otMessageAppend(msg, p, strlen(p));
-
-        otUdpSocket ephemeralSocket;
-        memset(&ephemeralSocket, 0, sizeof(ephemeralSocket));
-        otUdpOpen(inst, &ephemeralSocket, NULL, NULL);
-
-        otMessageInfo messageInfo;
-        memset(&messageInfo, 0, sizeof(messageInfo));
-        messageInfo.mPeerPort = 1234;
-        
-        // Target the Commissioner without hardcoding IP via Realm-Local All-Routers multicast
-        otIp6AddressFromString("ff03::2", &messageInfo.mPeerAddr);
-
-        otError sendErr = otUdpSend(inst, &ephemeralSocket, msg, &messageInfo);
-        otUdpClose(inst, &ephemeralSocket);
-
-        if (sendErr == OT_ERROR_NONE) {
-          Serial.println("[UDP] Packet sent to Router (temp=23)");
-        } else {
-          Serial.printf("[UDP] Send failed: %d\n", sendErr);
-          otMessageFree(msg);
-        }
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      float temp = ds18b20.getTempCByIndex(i);
+      
+      // Add a comma between values
+      if (i > 0) strcat(payload, ",");
+      
+      // Catch disconnected sensors
+      if (temp == DEVICE_DISCONNECTED_C) {
+        strcat(payload, "err"); 
+      } else {
+        snprintf(tempStr, sizeof(tempStr), "%.1f", temp);
+        strcat(payload, tempStr);
       }
     }
-    esp_openthread_lock_release();
+
+    // 3b. Acquire OpenThread Lock and Transmit
+    if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
+      otInstance *inst = esp_openthread_get_instance();
+      otDeviceRole currentRole = otThreadGetDeviceRole(inst);
+
+      // Only send data if attached to the mesh as a CHILD
+      if (currentRole == OT_DEVICE_ROLE_CHILD) {
+        last = millis(); // Reset timer only upon successful check
+
+        otMessage *msg = otUdpNewMessage(inst, NULL);
+        if (msg != NULL) {
+          
+          otMessageAppend(msg, payload, strlen(payload));
+
+          otUdpSocket ephemeralSocket;
+          memset(&ephemeralSocket, 0, sizeof(ephemeralSocket));
+          otUdpOpen(inst, &ephemeralSocket, NULL, NULL);
+
+          otMessageInfo messageInfo;
+          memset(&messageInfo, 0, sizeof(messageInfo));
+          messageInfo.mPeerPort = 1234;
+          
+          otIp6AddressFromString("ff03::2", &messageInfo.mPeerAddr);
+
+          otError sendErr = otUdpSend(inst, &ephemeralSocket, msg, &messageInfo);
+          otUdpClose(inst, &ephemeralSocket);
+
+          if (sendErr == OT_ERROR_NONE) {
+            Serial.printf("[UDP] Packet sent: %s\n", payload);
+          } else {
+            Serial.printf("[UDP] Send failed: %d\n", sendErr);
+            otMessageFree(msg);
+          }
+        }
+      }
+      esp_openthread_lock_release();
+    }
   }
 
   delay(10);

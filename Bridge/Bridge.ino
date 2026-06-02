@@ -10,7 +10,7 @@
 #define SD_CS 3
 #define SD_SCK 8
 #define SD_MOSI 10
-#define SD_MISO 4
+#define SD_MISO 4 
 
 // --- Configuration ---
 static const int UART_BAUD_RATE = 115200;
@@ -54,6 +54,29 @@ volatile bool bleClientSecured = false;        // OS-Level Encryption (Just Work
 volatile bool isSessionAuthenticated = false;  // App-Level Authentication
 bool isCommissionerMode = false;
 // State tracked via Switch
+
+// True only on the unit whose C6 is the Thread Leader (the active gateway).
+// Wi-Fi/uplink is brought up only on the active gateway; all others hold the
+// replicated credentials in NVS on standby.
+bool isActiveGateway = false;
+
+// Stand-down hysteresis: a freshly-forming gateway and a brief partition blip
+// both transiently report non-Leader. Don't drop Wi-Fi immediately on STANDBY —
+// only after it persists past the grace period.
+bool     standbyPending = false;
+uint32_t standbyPendingSince = 0;
+static const uint32_t STANDBY_GRACE_MS = 30000;
+
+// BLE management endpoint gating: only the ACTIVE gateway (Thread Leader) — or a
+// not-yet-networked unit in setup mode — advertises, so the app sees one device.
+bool c6OnNetwork = false;   // true once the C6 has reported any GW_ROLE (it's a mesh member)
+bool bleStackUp  = false;   // whether the NimBLE stack/advertising is currently active
+
+// Forward declarations (definitions live further down)
+void configureBLE();
+void deinitBLE();
+static bool bleShouldAdvertise();
+static void updateBleAdvertising();
 
 // Pending command tracking
 static bool g_pendingAdd = false;
@@ -114,12 +137,17 @@ void handleProvisioning(const String &jsonPayload) {
   preferences.putString("ssid", ssid);
   preferences.putString("pass", pass);
   preferences.putString("zone", zone ? zone : "Default");
+  preferences.putString("net", netName);
   preferences.end();
 
-  // 2. Connect to Wi-Fi
+  // 2. Connect to Wi-Fi (drop any prior association first so switching to a
+  //    different SSID on re-provisioning is reliable).
   Serial.printf("[WIFI] Connecting to %s...\n", ssid);
   bleNotifyLine("STATUS CONNECTING_WIFI");
 
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
   WiFi.begin(ssid, pass);
 
   int retries = 0;
@@ -136,9 +164,116 @@ void handleProvisioning(const String &jsonPayload) {
     Serial1.printf("FORM_NET %s\n", netName);
     Serial1.flush();
     Serial.println("[UART] Sent FORM_NET command");
+
+    // 4. Replicate these creds to the whole fleet via the mesh (C6 signs +
+    //    multicasts). Every router stores them on standby so any unit can
+    //    become the gateway. Include the admin PIN if one has been set (else
+    //    "-" = leave PIN unchanged). (Fields must not contain '|'.)
+    preferences.begin(AUTH_NAMESPACE, true);
+    bool setupDone = preferences.getBool("is_setup", false);
+    String curPin  = preferences.getString("pin", DEFAULT_PIN);
+    preferences.end();
+    const char *pinField = setupDone ? curPin.c_str() : "-";
+
+    Serial1.printf("cfg_publish %s|%s|%s|%s|%s\n",
+                   ssid, pass, zone ? zone : "Default", netName, pinField);
+    Serial1.flush();
+    Serial.println("[UART] Sent cfg_publish for mesh-wide credential replication");
+
+    // This unit just provisioned -> it will become the Leader/active gateway;
+    // GW_ROLE LEADER from the C6 will (re)assert Wi-Fi after boot.
+    isActiveGateway = true;
   } else {
     Serial.println("[WIFI] Failed to connect.");
     bleNotifyLine("ERR WIFI_AUTH");
+  }
+}
+
+// --- Wi-Fi bring-up helper ---
+// Cleanly switches APs: dropping any prior association first makes re-provisioning
+// to a different SSID reliable on the ESP32.
+static void applyWifi(const String &ssid, const String &pass) {
+  if (ssid.length() == 0) return;
+  Serial.printf("[WIFI] (Re)connecting to %s...\n", ssid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+}
+
+// --- C6 -> C3: store replicated credentials (standby) ---
+// Payload: "ssid|pass|zone|net|pin". Never forwarded to BLE (carries secrets).
+// pin == "-" means "leave the local admin PIN unchanged".
+static void handleCfgSet(const String &payload) {
+  int p1 = payload.indexOf('|');
+  int p2 = payload.indexOf('|', p1 + 1);
+  int p3 = payload.indexOf('|', p2 + 1);
+  int p4 = payload.indexOf('|', p3 + 1);
+  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return;
+
+  String ssid = payload.substring(0, p1);
+  String pass = payload.substring(p1 + 1, p2);
+  String zone = payload.substring(p2 + 1, p3);
+  String net  = payload.substring(p3 + 1, p4);
+  String pin  = payload.substring(p4 + 1);
+
+  preferences.begin("gateway_config", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  preferences.putString("zone", zone);
+  preferences.putString("net",  net);
+  preferences.end();
+
+  Serial.printf("[CFG] Stored replicated creds (ssid=%s, net=%s)\n", ssid.c_str(), net.c_str());
+
+  // Replicated admin PIN: store it so this unit accepts the same fleet PIN.
+  if (pin.length() > 0 && pin != "-") {
+    preferences.begin(AUTH_NAMESPACE, false);
+    preferences.putString("pin", pin);
+    preferences.putBool("is_setup", true);
+    preferences.end();
+    Serial.println("[CFG] Replicated admin PIN stored (fleet PIN updated).");
+  }
+
+  // If this unit is currently the active gateway, re-apply with the new creds.
+  if (isActiveGateway) applyWifi(ssid, pass);
+}
+
+// --- C6 -> C3: gateway-role signal tied to Thread leadership ---
+// Payload: "LEADER" (this unit is the active gateway) or "STANDBY".
+static void handleGatewayRole(const String &role) {
+  bool wantGateway = role.startsWith("LEADER");
+  c6OnNetwork = true;  // any GW_ROLE means our C6 is a network member now
+
+  if (wantGateway) {
+    // Leader -> we are (or remain) the active gateway. Cancel any pending
+    // stand-down and make sure Wi-Fi + the management BLE are up.
+    standbyPending = false;
+    if (!isActiveGateway) {
+      isActiveGateway = true;
+      Serial.println("[GW] Now ACTIVE gateway (Leader).");
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      preferences.begin("gateway_config", true);
+      String ssid = preferences.getString("ssid", "");
+      String pass = preferences.getString("pass", "");
+      preferences.end();
+      applyWifi(ssid, pass);
+    }
+    updateBleAdvertising();
+  } else {
+    // STANDBY -> don't drop Wi-Fi immediately; start the grace timer. A
+    // freshly-forming gateway reports non-Leader for ~15-20s before promotion,
+    // and we must not tear down the uplink we just brought up. loop() drops
+    // Wi-Fi only if STANDBY is still in effect after STANDBY_GRACE_MS.
+    if (isActiveGateway && !standbyPending) {
+      standbyPending = true;
+      standbyPendingSince = millis();
+      Serial.println("[GW] STANDBY received — grace timer started before dropping Wi-Fi.");
+    } else if (!isActiveGateway) {
+      // Plain joined router (never the gateway): ensure management BLE is off.
+      updateBleAdvertising();
+    }
   }
 }
 
@@ -170,8 +305,27 @@ static void handleCommissionerLine(const String &line) {
   // 0. FILTER: Ignore self-echoed commands
   if (line.startsWith("CMD:")) return;
 
+  // 0b. Control lines from the Commissioner (C6). Handle locally and DO NOT
+  //     forward to BLE — CFG_SET carries the Wi-Fi password.
+  if (line.startsWith("CFG_SET ")) {
+    handleCfgSet(line.substring(8));
+    return;
+  }
+  if (line.startsWith("GW_ROLE ")) {
+    handleGatewayRole(line.substring(8));
+    return;
+  }
+
   // Forward raw logs for debug
   bleNotifyLine(line);
+
+  // --- NEW: Intercept and explicitly print thread sensor UDP data ---
+  if (line.indexOf("[UDP_RX]") >= 0) {
+    Serial.println("\n========== THREAD SENSOR DATA ==========");
+    Serial.println(line);
+    Serial.println("========================================\n");
+    return; // Already handled
+  }
 
   // 1. Check for Network Formation
   if (line.indexOf("NETWORK_FORMED") >= 0) {
@@ -235,9 +389,9 @@ class BridgeServerCallbacks : public NimBLEServerCallbacks {
     isSessionAuthenticated = false;  // Clear session state
     Serial.println("[BLE] Disconnected.");
 
-    if (isCommissionerMode) {
+    if (bleShouldAdvertise()) {
       NimBLEDevice::startAdvertising();
-      Serial.println("[BLE] Restarted Advertising (Setup Mode Active).");
+      Serial.println("[BLE] Restarted Advertising.");
     }
   }
 
@@ -316,10 +470,12 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         preferences.begin(AUTH_NAMESPACE, false);
         String savedPin = preferences.getString("pin", DEFAULT_PIN);
 
+        bool pinChanged = false;
         if (oldPin == savedPin) {
           preferences.putString("pin", newPin);
           preferences.putBool("is_setup", true);
           isSessionAuthenticated = true;  // Auto-login after setup
+          pinChanged = true;
           bleNotifyLine("ACK SETPIN SUCCESS");
           Serial.println("[AUTH] PIN updated and session unlocked");
         } else {
@@ -327,6 +483,27 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
           Serial.println("[AUTH] SETPIN failed: Old PIN mismatch");
         }
         preferences.end();
+
+        // Replicate the new PIN fleet-wide via the mesh (C6 signs + multicasts),
+        // so every router accepts the same admin PIN. Only if Wi-Fi is already
+        // provisioned (non-empty SSID); otherwise it goes out with provisioning.
+        if (pinChanged) {
+          preferences.begin("gateway_config", true);
+          String s = preferences.getString("ssid", "");
+          String p = preferences.getString("pass", "");
+          String z = preferences.getString("zone", "Default");
+          String n = preferences.getString("net", "");
+          preferences.end();
+
+          if (s.length() > 0) {
+            Serial1.printf("cfg_publish %s|%s|%s|%s|%s\n",
+                           s.c_str(), p.c_str(), z.c_str(), n.c_str(), newPin.c_str());
+            Serial1.flush();
+            Serial.println("[AUTH] Published new fleet PIN via mesh.");
+          } else {
+            Serial.println("[AUTH] PIN set; will replicate once Wi-Fi is provisioned.");
+          }
+        }
       } else {
         bleNotifyLine("ERR SETPIN FORMAT");
       }
@@ -378,7 +555,12 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 
 // --- BLE Lifecycle ---
 void configureBLE() {
-  NimBLEDevice::init(DEVICE_NAME);
+  // Per-unit name so a human can identify which physical box is the gateway.
+  char devName[32];
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(devName, sizeof(devName), "%s-%04X", DEVICE_NAME, (uint16_t)(mac & 0xFFFF));
+
+  NimBLEDevice::init(devName);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
@@ -398,7 +580,26 @@ void configureBLE() {
   pAdvertising->addServiceUUID(SERVICE_UUID);
 
   NimBLEDevice::startAdvertising();
-  Serial.println("[BLE] Stack Initialized & Advertising.");
+  Serial.printf("[BLE] Stack Initialized & Advertising as %s.\n", devName);
+}
+
+// --- BLE management-endpoint gating ---
+// Only the ACTIVE gateway (Thread Leader) advertises for management, so the app
+// sees a single device. A unit not yet on a network advertises only when placed
+// in setup mode (switch), so a fresh unit can still be provisioned.
+static bool bleShouldAdvertise() {
+  return isActiveGateway || (isCommissionerMode && !c6OnNetwork);
+}
+
+static void updateBleAdvertising() {
+  bool want = bleShouldAdvertise();
+  if (want && !bleStackUp) {
+    configureBLE();
+    bleStackUp = true;
+  } else if (!want && bleStackUp) {
+    deinitBLE();
+    bleStackUp = false;
+  }
 }
 
 void deinitBLE() {
@@ -449,8 +650,11 @@ void setup() {
   preferences.end();
 
   if (savedSSID.length() > 0) {
-    Serial.printf("[BOOT] Auto-connecting to WiFi: %s\n", savedSSID.c_str());
-    WiFi.begin(savedSSID.c_str(), savedPass.c_str());
+    // Do NOT auto-connect here. Wi-Fi is brought up only when the C6 signals
+    // GW_ROLE LEADER (this unit is the active gateway). This prevents multiple
+    // units from all claiming the uplink. The C6 re-signals role every ~10s.
+    Serial.printf("[BOOT] Wi-Fi creds present (SSID: %s). Waiting for GW_ROLE from Commissioner...\n",
+                  savedSSID.c_str());
   }
 }
 
@@ -502,13 +706,13 @@ void loop() {
     isCommissionerMode = true;
 
     Serial.println("[MODE] Switch ON -> Enter SETUP/COMMISSIONER Mode");
-    configureBLE();
+    updateBleAdvertising();   // advertises if fresh/unprovisioned (or already gateway)
     Serial1.println("commissioner_start");
   } else if (switchState == LOW && isCommissionerMode) {
     isCommissionerMode = false;
 
     Serial.println("[MODE] Switch OFF -> Enter SECURE Mode");
-    deinitBLE();
+    updateBleAdvertising();   // keeps BLE up only if this unit is the active gateway
     Serial1.println("commissioner_stop");
   }
 
@@ -539,6 +743,16 @@ void loop() {
         lineLen = 0;
       }
     }
+  }
+
+  // 2b. Gateway stand-down hysteresis: only drop Wi-Fi if STANDBY persisted
+  //     past the grace period (a real demotion, not a formation/partition blip).
+  if (standbyPending && (millis() - standbyPendingSince >= STANDBY_GRACE_MS)) {
+    standbyPending = false;
+    isActiveGateway = false;
+    Serial.println("[GW] STANDBY confirmed — dropping Wi-Fi + management BLE (no longer the gateway).");
+    WiFi.disconnect(true);
+    updateBleAdvertising();   // stop advertising; this unit is now a plain router
   }
 
   // 3. Pending Timeout Check (Bridge failsafe)

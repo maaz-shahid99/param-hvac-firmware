@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @brief Start the Thread Commissioner
@@ -14,6 +15,20 @@ void commissioner_start(void);
  * @brief Stop the Thread Commissioner
  */
 void commissioner_stop(void);
+
+/**
+ * @brief Add a joiner, self-healing if the commissioner session has dropped.
+ *
+ * If the commissioner is ACTIVE the joiner is added immediately. Otherwise the
+ * joiner is queued, the commissioner is re-petitioned, and the joiner is added
+ * automatically once the commissioner reaches the ACTIVE state.
+ *
+ * Prints the protocol response (`JOINER_ADDED <eui>` / `ERROR ADD_FAILED <n>` /
+ * `COMMISSIONER_REPETITIONING`) so callers don't need to.
+ *
+ * @return true if the joiner was added immediately, false if queued/failed.
+ */
+bool commissioner_add_joiner(const char *eui64, const char *pskd, uint32_t timeout);
 
 /**
  * @brief Check if Commissioner is active

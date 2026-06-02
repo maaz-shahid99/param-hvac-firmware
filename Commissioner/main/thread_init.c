@@ -20,6 +20,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "commissioner.h"
+#include "joiner_role.h"
+#include "config_sync.h"
 
 static const char *TAG = "THREAD";
 
@@ -37,8 +39,32 @@ void form_new_network(const char *network_name) {
     otInstance *instance = esp_openthread_get_instance();
     
     if (esp_openthread_lock_acquire(pdMS_TO_TICKS(5000))) {
+
+        // This device has been designated the network former. If it was
+        // scanning as a joiner (no dataset yet), abandon that role first.
+        router_joiner_stop();
+
+        // Idempotency guard: if we ALREADY hold a network, do NOT create a new
+        // one. otDatasetCreateNewNetwork() mints a fresh random Network Key,
+        // which would rotate the key and orphan every already-joined router.
+        // Re-assert the existing network instead. (Use 'factory_reset' to
+        // intentionally start a brand-new network from scratch.)
+        otOperationalDataset existing;
+        if (otDatasetGetActive(instance, &existing) == OT_ERROR_NONE) {
+            ESP_LOGW(TAG, "Network already exists (PAN 0x%04X) — FORM_NET ignored, key NOT rotated.",
+                     existing.mPanId);
+            // Already attached and running — do NOT toggle IP6/Thread here, that
+            // forces a needless detach/reattach blip (and drops the gateway Wi-Fi).
+            // Just acknowledge and make sure a commissioner is running.
+            printf("NETWORK_FORMED\n");      // keep the Bridge's provisioning flow happy
+            fflush(stdout);
+            esp_openthread_lock_release();
+            xTaskCreate(delayed_commissioner_start_task, "delay_comm", 3072, NULL, 5, NULL);
+            return;
+        }
+
         ESP_LOGI(TAG, "Creating New Network Dataset...");
-        
+
         otThreadSetEnabled(instance, false);
         otIp6SetEnabled(instance, false);
         
@@ -76,7 +102,11 @@ void form_new_network(const char *network_name) {
         fflush(stdout);
 
         ESP_LOGI(TAG, "Network '%s' configured. Waiting for stack promotion...", network_name);
-        
+
+        // This node just became a network member (the former) -> start
+        // credential replication now (we still hold the OT lock here).
+        config_sync_init();
+
         esp_openthread_lock_release();
 
         xTaskCreate(delayed_commissioner_start_task, "delay_comm", 3072, NULL, 5, NULL);
@@ -122,8 +152,31 @@ void thread_init(void)
     }
 
     otInstance *instance = esp_openthread_get_instance();
-    otIp6SetEnabled(instance, true);
-    otThreadSetEnabled(instance, true);
+
+    // --- Boot role decision ---------------------------------------------
+    // 1. If we already hold network credentials, just attach (this is the
+    //    network former rejoining, OR a router that joined previously).
+    // 2. Otherwise become a Joiner and wait to be commissioned into a network.
+    //    A device explicitly told to FORM_NET will override this and become
+    //    the former (see form_new_network()).
+    otOperationalDataset dataset;
+    if (otDatasetGetActive(instance, &dataset) == OT_ERROR_NONE) {
+        ESP_LOGI(TAG, "Existing dataset found (PAN 0x%04X). Attaching to network...",
+                 dataset.mPanId);
+        otIp6SetEnabled(instance, true);
+        otThreadSetEnabled(instance, true);
+
+        // We are already a network member -> start credential replication.
+        // IMPORTANT: do NOT start this on the joiner path. While joining, the
+        // config-sync task would contend for the OpenThread lock and emit
+        // multicasts, disrupting the DTLS commissioning handshake. A joiner
+        // reboots after a successful join and re-enters this branch.
+        config_sync_init();
+    } else {
+        ESP_LOGW(TAG, "No dataset found. Starting Joiner (router) — "
+                      "scanning for a network to join...");
+        router_joiner_start();
+    }
 
     ESP_LOGI(TAG, "Launching Main Loop");
     esp_openthread_launch_mainloop();

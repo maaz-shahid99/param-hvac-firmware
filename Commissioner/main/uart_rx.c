@@ -16,6 +16,7 @@
 #include "thread_init.h"
 #include "commissioner.h"
 #include "joiner_manager.h"
+#include "config_sync.h"
 
 // Forward declaration for security check
 bool verify_command_signature(char *input_buffer, char **cmd_part);
@@ -75,7 +76,38 @@ static void process_command(char *raw_input) {
         free(cmd_copy);
         return;
     }
-    free(cmd_copy); 
+
+    // C3 -> C6: locally-provisioned Wi-Fi/app creds to replicate across the mesh.
+    // Format: "cfg_publish <ssid>|<pass>|<zone>|<net>|<pin>"  (fields must not
+    // contain '|'; <pin> is "-" to leave the fleet PIN unchanged)
+    if (token && strcmp(token, "cfg_publish") == 0) {
+        const char *payload = raw_input + strlen("cfg_publish");
+        while (*payload == ' ') payload++;
+
+        char tmp[256];
+        strncpy(tmp, payload, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        char *save = NULL;
+        char *ssid = strtok_r(tmp,  "|", &save);
+        char *pass = strtok_r(NULL, "|", &save);
+        char *zone = strtok_r(NULL, "|", &save);
+        char *net  = strtok_r(NULL, "|", &save);
+        char *pin  = strtok_r(NULL, "|", &save);
+
+        if (ssid && pass && net) {
+            config_sync_publish_local(ssid, pass, zone ? zone : "Default", net,
+                                      pin ? pin : "-");
+            printf("CFG_PUBLISHED\n");
+        } else {
+            printf("ERROR CFG_PUBLISH_FORMAT\n");
+        }
+        fflush(stdout);
+        free(cmd_copy);
+        return;
+    }
+
+    free(cmd_copy);
 
     // 2. SIGNED Commands
     // Keep a copy of raw_input for debugging before verify modifies it
@@ -97,29 +129,29 @@ static void process_command(char *raw_input) {
         char *id_str = strtok(NULL, " ");
         char *cred = strtok(NULL, " ");
         char *timeout_str = strtok(NULL, " "); // Extract timeout if provided
-        
+
         if (id_str && cred) {
-            // ---> THE DEBUG PRINTS <---
+            uint32_t timeout = timeout_str ? (uint32_t)strtoul(timeout_str, NULL, 10) : 120;
+            if (timeout == 0) timeout = 120;
+
             ESP_LOGE(TAG, "========= PARSED VALUES =========");
             ESP_LOGE(TAG, "Raw Input: '%s'", raw_debug);
             ESP_LOGE(TAG, "EUI64    : '%s'", id_str);
             ESP_LOGE(TAG, "PSKD     : '%s'", cred);
-            if (timeout_str) {
-                ESP_LOGE(TAG, "Timeout  : '%s'", timeout_str);
-            }
+            ESP_LOGE(TAG, "Timeout  : %lu", (unsigned long)timeout);
             ESP_LOGE(TAG, "=================================");
 
-            // REFACTORED: Pass logic to joiner_manager
-            otError err = joiner_add_request("*", cred, 120);
-
-            if (err == OT_ERROR_NONE) {
-                // Bridge expects this exact string
-                printf("JOINER_ADDED %s\n", id_str); 
+            // Bind this PSKD to the scanned EUI64 only — reject wildcards.
+            if (strcmp(id_str, "*") == 0) {
+                printf("ERROR ADD_FAILED WILDCARD_NOT_ALLOWED\n");
             } else {
-                printf("ERROR ADD_FAILED %d\n", err);
+                // Self-healing add: re-petitions the commissioner if its session
+                // has dropped, then applies the joiner once ACTIVE. Prints the
+                // protocol response itself (JOINER_ADDED / ERROR / REPETITIONING).
+                commissioner_add_joiner(id_str, cred, timeout);
             }
         }
-    } 
+    }
     else if (strcmp(token, "factory_reset") == 0) {
         nvs_flash_erase();
         esp_restart();

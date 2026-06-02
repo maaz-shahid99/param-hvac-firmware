@@ -6,6 +6,8 @@ idf_component_register(
         "uart_rx.c"
         "security.c"
         "joiner_manager.c"
+        "joiner_role.c"
+        "config_sync.c"
         "udp_listener.c"
     INCLUDE_DIRS "."
     REQUIRES

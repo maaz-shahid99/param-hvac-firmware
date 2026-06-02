@@ -22,13 +22,15 @@ static bool hex_to_bytes(const char *hex_str, uint8_t *bytes, size_t len) {
 }
 
 // --- Public API ---
-otError joiner_add_request(const char *eui64_str, const char *pskd, uint32_t timeout)
+
+// Lock-free variant: caller MUST already hold the OpenThread lock (or be in the
+// OpenThread task context, e.g. a commissioner callback).
+otError joiner_add_locked(const char *eui64_str, const char *pskd, uint32_t timeout)
 {
     otExtAddress id;
     otExtAddress *p_id = NULL;
-    otError err = OT_ERROR_NONE;
 
-    // 1. Parse EUI64 (if not wildcard)
+    // Parse EUI64 (if not wildcard)
     if (eui64_str && strcmp(eui64_str, "*") != 0) {
         if (!hex_to_bytes(eui64_str, id.m8, 8)) {
             ESP_LOGE(TAG, "Invalid EUI64 format: %s", eui64_str);
@@ -37,25 +39,28 @@ otError joiner_add_request(const char *eui64_str, const char *pskd, uint32_t tim
         p_id = &id;
     }
 
-    // 2. Acquire Lock (Critical for OpenThread stability)
-    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
-        ESP_LOGE(TAG, "Failed to acquire OpenThread lock");
-        return OT_ERROR_BUSY;
-    }
-
-    // 3. Call OpenThread API
     otInstance *instance = esp_openthread_get_instance();
-    err = otCommissionerAddJoiner(instance, p_id, pskd, timeout);
+    otError err = otCommissionerAddJoiner(instance, p_id, pskd, timeout);
 
-    // 4. Release Lock
-    esp_openthread_lock_release();
-
-    // 5. Log Result (Internal Log)
     if (err == OT_ERROR_NONE) {
         ESP_LOGI(TAG, "Joiner added successfully: %s", eui64_str);
     } else {
         ESP_LOGW(TAG, "Failed to add joiner: %s (%d)", eui64_str, err);
     }
 
+    return err;
+}
+
+otError joiner_add_request(const char *eui64_str, const char *pskd, uint32_t timeout)
+{
+    // Acquire Lock (Critical for OpenThread stability)
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+        ESP_LOGE(TAG, "Failed to acquire OpenThread lock");
+        return OT_ERROR_BUSY;
+    }
+
+    otError err = joiner_add_locked(eui64_str, pskd, timeout);
+
+    esp_openthread_lock_release();
     return err;
 }
