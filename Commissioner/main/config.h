@@ -18,7 +18,7 @@
 // --- OTA ---
 // C6 firmware version, reported to the C3 so fleet OTA only applies newer images.
 // Bump this on every Commissioner build you publish.
-#define COMMISSIONER_FW_VERSION     3
+#define COMMISSIONER_FW_VERSION     7
 
 // --- Router Joiner (device-side commissioning) ---
 // Used when a device boots WITHOUT an operational dataset and is NOT the

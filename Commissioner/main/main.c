@@ -62,7 +62,7 @@ static void ot_task_worker(void *arg)
 void app_main(void)
 {
     // OTA TEST MARKER — if you see this line on boot, the new firmware is running.
-    ESP_LOGW(TAG, "=== Commissioner OTA TEST BUILD v3===");
+    ESP_LOGW(TAG, "=== Commissioner OTA TEST BUILD v7===");
 
     // 1. Initialize Watchdog (Optional, enable if production requires strict timeouts)
     // esp_task_wdt_init(10, true);

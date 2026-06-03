@@ -9,7 +9,7 @@
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 2
+#define BRIDGE_FW_VERSION 7
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
 #include "logger.h"
