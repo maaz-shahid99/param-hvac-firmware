@@ -17,6 +17,7 @@
 #include "commissioner.h"
 #include "joiner_manager.h"
 #include "config_sync.h"
+#include "ota_uart.h"
 
 // Forward declaration for security check
 bool verify_command_signature(char *input_buffer, char **cmd_part);
@@ -36,7 +37,25 @@ static void process_command(char *raw_input) {
 
     if (strlen(raw_input) == 0) return;
 
-    ESP_LOGI(TAG, "Processing cmd len: %d", len);
+    // OTA streams thousands of OTA_DATA lines — don't log each one (it would
+    // double the UART traffic back to the C3 and slow the transfer).
+    if (strncmp(raw_input, "OTA_", 4) != 0)
+        ESP_LOGI(TAG, "Processing cmd len: %d", len);
+
+    // --- UART OTA (C3 streams the C6 image). Handle before the copy/strtok. ---
+    if (strncmp(raw_input, "OTA_BEGIN ", 10) == 0) {
+        ota_uart_begin((size_t)strtoul(raw_input + 10, NULL, 10));
+        return;
+    }
+    if (strncmp(raw_input, "OTA_DATA ", 9) == 0) {
+        char *p = raw_input + 9;
+        char *sp = strchr(p, ' ');
+        if (sp) { *sp = '\0'; ota_uart_data(atoi(p), sp + 1); }
+        else { printf("OTA_ERR FORMAT\n"); fflush(stdout); }
+        return;
+    }
+    if (strcmp(raw_input, "OTA_END") == 0)   { ota_uart_end();   return; }
+    if (strcmp(raw_input, "OTA_ABORT") == 0) { ota_uart_abort(); return; }
 
     char *cmd_str = NULL;
     char *cmd_copy = strdup(raw_input);

@@ -1,9 +1,15 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <nvs_flash.h>  // Added for full NVS wipe
+#include "mbedtls/base64.h"
+
+// Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
+// c3_version from the manifest.
+#define BRIDGE_FW_VERSION 2
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
 #include "logger.h"
@@ -121,6 +127,17 @@ static bool looksLikeEui64(const String &s) {
   for (int i = 0; i < 16; i++)
     if (!isHexChar(s[i])) return false;
   return true;
+}
+
+// Strip a trailing "|<64-hex HMAC>" signature (the app appends one to signed
+// commands). Used for commands handled locally on the C3 (MAP, OTA) — they're
+// gated by the authenticated session, so the signature isn't verified here.
+static String stripTrailingSig(const String &line) {
+  int bar = line.lastIndexOf('|');
+  if (bar < 0 || (int)(line.length() - bar - 1) != 64) return line;
+  for (int i = bar + 1; i < (int)line.length(); i++)
+    if (!isHexChar(line[i])) return line;
+  return line.substring(0, bar);
 }
 
 // --- Provisioning Logic (JSON Parsing & Wi-Fi) ---
@@ -372,6 +389,76 @@ static bool registerSensorMap(const String &eui, int box, const String &slot) {
   int code = http.POST(body);
   http.end();
   return code == 200;
+}
+
+// --- OTA: self-update the C3 from a firmware URL over Wi-Fi ---
+static void otaC3FromUrl(const String &url) {
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(20000);
+  if (!http.begin(url)) { bleNotifyLine("ERR OTA BEGIN_URL"); return; }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    bleNotifyLine("ERR OTA HTTP " + String(code));
+    http.end();
+    return;
+  }
+
+  int len = http.getSize();                 // -1 if chunked/unknown
+  if (!Update.begin(len > 0 ? (size_t)len : UPDATE_SIZE_UNKNOWN)) {
+    bleNotifyLine("ERR OTA NOSPACE");
+    http.end();
+    return;
+  }
+
+  Serial.printf("[OTA] Downloading C3 image (%d bytes)...\n", len);
+  bleNotifyLine("OTA DOWNLOADING");
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  http.end();
+
+  if (!Update.end(true)) {
+    Serial.printf("[OTA] failed: %s\n", Update.errorString());
+    bleNotifyLine("ERR OTA " + String(Update.getError()));
+    return;
+  }
+
+  Serial.printf("[OTA] C3 update OK (%u bytes). Rebooting...\n", (unsigned)written);
+  bleNotifyLine("OTA SUCCESS REBOOTING");
+  delay(500);
+  ESP.restart();
+}
+
+// Check the manifest on the display node and self-update if a newer C3 build
+// is published. (Phase 1: this unit only. Fleet rollout = Phase 3.)
+static void performOtaCheck() {
+  if (g_nodeUrl.isEmpty()) { bleNotifyLine("ERR OTA NO_NODE"); return; }
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
+  if (!http.begin(g_nodeUrl + "/firmware/manifest.json")) { bleNotifyLine("ERR OTA MANIFEST"); return; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { bleNotifyLine("ERR OTA MANIFEST " + String(code)); http.end(); return; }
+
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) { bleNotifyLine("ERR OTA MANIFEST_JSON"); return; }
+
+  int c3ver = doc["c3_version"] | 0;
+  String c3file = doc["c3_file"] | "";
+  Serial.printf("[OTA] manifest c3_version=%d (running %d)\n", c3ver, BRIDGE_FW_VERSION);
+
+  if (c3ver <= BRIDGE_FW_VERSION || c3file.isEmpty()) {
+    bleNotifyLine("OTA UP_TO_DATE");
+    return;
+  }
+
+  bleNotifyLine("OTA UPDATING v" + String(c3ver));
+  otaC3FromUrl(g_nodeUrl + "/firmware/" + c3file);
 }
 
 // --- Parsing Pending Adds ---
@@ -641,17 +728,21 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
+    // Commands handled locally on the C3 (MAP, OTA) may arrive signed (the app
+    // appends "|<hmac>"); strip it — the authenticated session is the gate here.
+    String sCmd = stripTrailingSig(cmdLine);
+
     // A2. MAP — assign a sensor's EUI to a physical box/slot at commissioning.
     //     Format: "MAP|<EUI16hex>|<box>|<slot>"  e.g. "MAP|58e6c5fffe164ec0|3|A"
     //     Forwarded to the display node (the central EUI->box/slot table).
-    if (cmdLine.startsWith("MAP|")) {
-      int p1 = cmdLine.indexOf('|');
-      int p2 = cmdLine.indexOf('|', p1 + 1);
-      int p3 = cmdLine.indexOf('|', p2 + 1);
+    if (sCmd.startsWith("MAP|")) {
+      int p1 = sCmd.indexOf('|');
+      int p2 = sCmd.indexOf('|', p1 + 1);
+      int p3 = sCmd.indexOf('|', p2 + 1);
       if (p1 > 0 && p2 > p1 && p3 > p2) {
-        String eui  = cmdLine.substring(p1 + 1, p2);
-        int    box  = cmdLine.substring(p2 + 1, p3).toInt();
-        String slot = cmdLine.substring(p3 + 1);
+        String eui  = sCmd.substring(p1 + 1, p2);
+        int    box  = sCmd.substring(p2 + 1, p3).toInt();
+        String slot = sCmd.substring(p3 + 1);
         eui.toLowerCase();
         slot.toUpperCase();
         bool ok = registerSensorMap(eui, box, slot);
@@ -660,6 +751,14 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       } else {
         bleNotifyLine("ERR MAP FORMAT");
       }
+      return;
+    }
+
+    // A3. OTA — check the firmware manifest and self-update this gateway's C3.
+    //     (Phase 1: this unit only. Fleet-wide rollout is Phase 3.)
+    if (sCmd == "OTA") {
+      Serial.println("[OTA] Manual OTA check requested");
+      performOtaCheck();
       return;
     }
 

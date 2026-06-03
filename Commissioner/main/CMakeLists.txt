@@ -8,6 +8,7 @@ idf_component_register(
         "joiner_manager.c"
         "joiner_role.c"
         "config_sync.c"
+        "ota_uart.c"
         "udp_listener.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -17,4 +18,5 @@ idf_component_register(
         nvs_flash
         driver
         mbedtls
+        app_update
 )
