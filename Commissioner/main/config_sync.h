@@ -36,3 +36,13 @@ void config_sync_init(void);
 void config_sync_publish_local(const char *ssid, const char *pass,
                                const char *zone, const char *net_name,
                                const char *pin);
+
+/**
+ * @brief Broadcast a signed fleet-OTA command over the mesh.
+ *
+ * Sends "OTA|<nonce>|<baseurl>|<hmac>" to the mesh-local all-nodes group. Every
+ * node verifies it and relays "OTA_NOW <baseurl>" to its own C3, which then
+ * self-updates from <baseurl>/firmware/. Also triggers the local C3 (so the
+ * gateway updates too). @param baseurl e.g. "http://10.14.98.109:8001".
+ */
+void config_sync_broadcast_ota(const char *baseurl);

@@ -98,6 +98,20 @@ static uint32_t g_lastBeat     = 0;
 static const uint32_t DISCOVER_INTERVAL_MS = 10000;
 static const uint32_t BEAT_INTERVAL_MS     = 10000;
 
+// OTA is requested from the BLE task but RUN from loop() so that Serial1 has a
+// single reader during the C6 transfer. 0=none, 1=check/self-update C3, 2=push C6.
+volatile int g_pendingOta = 0;
+static void performOtaCheck();
+static void performOtaC6();
+
+// Fleet OTA: the C6 relays "OTA_NOW <baseurl>" (from the mesh broadcast). We
+// run it staggered (gateway last) so the whole fleet doesn't reboot at once.
+int      g_c6Version       = -1;     // reported by the C6 ("C6_VERSION n"); -1 = unknown
+bool     g_fleetOtaPending = false;
+String   g_fleetOtaBaseUrl;
+uint32_t g_fleetOtaAt      = 0;
+static void performFleetOta(const String &baseurl);
+
 // Pending command tracking
 static bool g_pendingAdd = false;
 static String g_pendingEui64;
@@ -461,6 +475,157 @@ static void performOtaCheck() {
   otaC3FromUrl(g_nodeUrl + "/firmware/" + c3file);
 }
 
+// ===== Phase 2: stream a C6 firmware image to the C6 over UART =====
+
+static void flushSerial1() { while (Serial1.available()) Serial1.read(); }
+
+// Wait for a UART line from the C6 that starts with `expected`. Ignores other
+// lines (logs, [UDP_RX], GW_ROLE, …). Returns false on timeout or OTA_ERR.
+static bool waitForUart(const String &expected, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  static char buf[600];
+  int pos = 0;
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available()) {
+      int c = Serial1.read();
+      if (c == '\n') {
+        buf[pos] = '\0';
+        String line(buf);
+        line.trim();
+        pos = 0;
+        if (line.startsWith(expected)) return true;
+        if (line.startsWith("OTA_ERR")) {
+          Serial.println("[OTAC6] C6 reported: " + line);
+          return false;
+        }
+      } else if (c != '\r' && pos < (int)sizeof(buf) - 1) {
+        buf[pos++] = (char)c;
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+static String base64Chunk(const uint8_t *data, size_t len) {
+  unsigned char out[720];          // 512 raw -> 684 b64 chars
+  size_t olen = 0;
+  if (mbedtls_base64_encode(out, sizeof(out), &olen, data, len) != 0) return String();
+  out[olen] = '\0';
+  return String((char *)out);
+}
+
+// Download the C6 image over Wi-Fi and stream it to the C6 via UART OTA.
+static bool otaC6FromUrl(const String &url) {
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(20000);
+  if (!http.begin(url)) { bleNotifyLine("ERR OTAC6 URL"); return false; }
+  if (http.GET() != HTTP_CODE_OK) { bleNotifyLine("ERR OTAC6 HTTP"); http.end(); return false; }
+
+  int total = http.getSize();
+  if (total <= 0) { bleNotifyLine("ERR OTAC6 NOSIZE"); http.end(); return false; }
+  WiFiClient *stream = http.getStreamPtr();
+
+  flushSerial1();
+  Serial1.printf("OTA_BEGIN %d\n", total);
+  Serial1.flush();
+  if (!waitForUart("OTA_READY", 8000)) { bleNotifyLine("ERR OTAC6 NOREADY"); http.end(); return false; }
+
+  Serial.printf("[OTAC6] streaming %d bytes to C6...\n", total);
+  bleNotifyLine("OTAC6 START " + String(total));
+
+  const size_t CHUNK = 512;
+  uint8_t raw[CHUNK];
+  int seq = 0;
+  size_t sent = 0;
+  while (sent < (size_t)total) {
+    size_t want = ((size_t)total - sent) < CHUNK ? ((size_t)total - sent) : CHUNK;
+    int n = stream->readBytes(raw, want);
+    if (n <= 0) { bleNotifyLine("ERR OTAC6 STREAM"); Serial1.println("OTA_ABORT"); http.end(); return false; }
+
+    Serial1.printf("OTA_DATA %d %s\n", seq, base64Chunk(raw, n).c_str());
+    Serial1.flush();
+    if (!waitForUart("OTA_ACK " + String(seq), 8000)) {
+      bleNotifyLine("ERR OTAC6 ACK " + String(seq));
+      Serial1.println("OTA_ABORT");
+      http.end();
+      return false;
+    }
+    sent += n;
+    seq++;
+    if ((seq % 64) == 0) { bleNotifyLine("OTAC6 " + String(sent) + "/" + String(total)); delay(1); }
+  }
+  http.end();
+
+  Serial1.println("OTA_END");
+  Serial1.flush();
+  if (!waitForUart("OTA_DONE", 15000)) { bleNotifyLine("ERR OTAC6 NODONE"); return false; }
+
+  Serial.println("[OTAC6] C6 update complete; C6 is rebooting.");
+  bleNotifyLine("OTAC6 SUCCESS");
+  return true;
+}
+
+// Read the manifest for the C6 image and stream it to the C6. Runs in loop().
+static void performOtaC6() {
+  if (g_nodeUrl.isEmpty()) { bleNotifyLine("ERR OTAC6 NO_NODE"); return; }
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
+  if (!http.begin(g_nodeUrl + "/firmware/manifest.json")) { bleNotifyLine("ERR OTAC6 MANIFEST"); return; }
+  String c6file;
+  if (http.GET() == HTTP_CODE_OK) {
+    DynamicJsonDocument doc(512);
+    if (!deserializeJson(doc, http.getString())) c6file = (const char *)(doc["c6_file"] | "");
+  }
+  http.end();
+  if (c6file.isEmpty()) { bleNotifyLine("ERR OTAC6 NO_FILE"); return; }
+  otaC6FromUrl(g_nodeUrl + "/firmware/" + c6file);
+}
+
+// Self-update this unit (C6 then C3) from <baseurl>/firmware, version-gated.
+// Runs in loop() context. Brings up Wi-Fi first if this is a standby unit.
+static void performFleetOta(const String &baseurl) {
+  // Ensure Wi-Fi (standby routers keep it off until they need it).
+  if (WiFi.status() != WL_CONNECTED) {
+    preferences.begin("gateway_config", true);
+    String s = preferences.getString("ssid", "");
+    String p = preferences.getString("pass", "");
+    preferences.end();
+    if (s.isEmpty()) { Serial.println("[FLEETOTA] no Wi-Fi creds; abort"); return; }
+    applyWifi(s, p);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+    if (WiFi.status() != WL_CONNECTED) { Serial.println("[FLEETOTA] Wi-Fi failed; abort"); return; }
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
+  if (!http.begin(baseurl + "/firmware/manifest.json")) { Serial.println("[FLEETOTA] manifest begin fail"); return; }
+  if (http.GET() != HTTP_CODE_OK) { Serial.println("[FLEETOTA] manifest HTTP fail"); http.end(); return; }
+  DynamicJsonDocument doc(512);
+  DeserializationError e = deserializeJson(doc, http.getString());
+  http.end();
+  if (e) { Serial.println("[FLEETOTA] manifest json fail"); return; }
+
+  int c3ver = doc["c3_version"] | 0; String c3file = doc["c3_file"] | "";
+  int c6ver = doc["c6_version"] | 0; String c6file = doc["c6_file"] | "";
+  Serial.printf("[FLEETOTA] manifest c3=%d (run %d), c6=%d (run %d)\n",
+                c3ver, BRIDGE_FW_VERSION, c6ver, g_c6Version);
+
+  // C6 first (it reboots independently; the C3 stays up to stream it).
+  if (!c6file.isEmpty() && c6ver > g_c6Version) {
+    otaC6FromUrl(baseurl + "/firmware/" + c6file);
+  }
+  // C3 last (this reboots us).
+  if (!c3file.isEmpty() && c3ver > BRIDGE_FW_VERSION) {
+    otaC3FromUrl(baseurl + "/firmware/" + c3file);
+  }
+  Serial.println("[FLEETOTA] complete (or already up-to-date)");
+}
+
 // --- Parsing Pending Adds ---
 static void parsePendingFromCommand(const String &cmdLine) {
   String line = cmdLine;
@@ -497,6 +662,22 @@ static void handleCommissionerLine(const String &line) {
   }
   if (line.startsWith("GW_ROLE ")) {
     handleGatewayRole(line.substring(8));
+    return;
+  }
+  if (line.startsWith("C6_VERSION ")) {
+    g_c6Version = line.substring(11).toInt();
+    return;
+  }
+  // Fleet OTA trigger relayed from the mesh by our C6. Schedule it staggered
+  // (gateway goes last) so the whole fleet doesn't reboot simultaneously.
+  if (line.startsWith("OTA_NOW ")) {
+    g_fleetOtaBaseUrl = line.substring(8);
+    g_fleetOtaBaseUrl.trim();
+    uint32_t delayMs = isActiveGateway ? 90000UL : (5000UL + (uint32_t)random(0, 40000));
+    g_fleetOtaAt = millis() + delayMs;
+    g_fleetOtaPending = true;
+    Serial.printf("[FLEETOTA] scheduled in %lus (gateway=%d) from %s\n",
+                  (unsigned long)(delayMs / 1000), isActiveGateway, g_fleetOtaBaseUrl.c_str());
     return;
   }
 
@@ -754,11 +935,18 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
-    // A3. OTA — check the firmware manifest and self-update this gateway's C3.
-    //     (Phase 1: this unit only. Fleet-wide rollout is Phase 3.)
-    if (sCmd == "OTA") {
-      Serial.println("[OTA] Manual OTA check requested");
-      performOtaCheck();
+    // A3. OTA — self-update this gateway's C3. A4. OTAC6 — push the C6 image.
+    //     Both are QUEUED here and executed in loop() so Serial1 has one reader.
+    if (sCmd == "OTA")   { g_pendingOta = 1; bleNotifyLine("OTA QUEUED");   return; }
+    if (sCmd == "OTAC6") { g_pendingOta = 2; bleNotifyLine("OTAC6 QUEUED"); return; }
+
+    // A5. OTA_FLEET — roll OTA out to the WHOLE fleet via a signed mesh broadcast.
+    if (sCmd == "OTA_FLEET") {
+      if (g_nodeUrl.isEmpty()) { bleNotifyLine("ERR OTAFLEET NO_NODE"); return; }
+      Serial1.println("ota_broadcast " + g_nodeUrl);   // C6 signs + multicasts it
+      Serial1.flush();
+      bleNotifyLine("OTA_FLEET BROADCASTING");
+      Serial.println("[FLEETOTA] broadcast requested -> " + g_nodeUrl);
       return;
     }
 
@@ -852,6 +1040,9 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
+  // Per-unit seed so fleet-OTA stagger delays differ across devices.
+  randomSeed((uint32_t)ESP.getEfuseMac());
+
   bmeInit();
   rtcInit();
 
@@ -930,6 +1121,22 @@ void loop() {
 
   static char lineBuf[UART_MAX_LINE_LEN];
   static size_t lineLen = 0;
+
+  // 0b. Run any queued OTA here (loop context = single Serial1 owner). The C6
+  //     push reads OTA_ACK lines synchronously, so it must not race loop()'s read.
+  if (g_pendingOta != 0) {
+    int op = g_pendingOta;
+    g_pendingOta = 0;
+    if (op == 1) performOtaCheck();
+    else if (op == 2) performOtaC6();
+  }
+
+  // 0c. Scheduled fleet OTA (staggered) — run in loop() (single Serial1 owner).
+  if (g_fleetOtaPending && (int32_t)(millis() - g_fleetOtaAt) >= 0) {
+    g_fleetOtaPending = false;
+    Serial.println("[FLEETOTA] starting self-update...");
+    performFleetOta(g_fleetOtaBaseUrl);
+  }
 
   // 1. Switch Logic
 

@@ -15,6 +15,11 @@
 #define THREAD_TASK_STACK_SIZE      8192
 #define THREAD_TASK_PRIORITY        5
 
+// --- OTA ---
+// C6 firmware version, reported to the C3 so fleet OTA only applies newer images.
+// Bump this on every Commissioner build you publish.
+#define COMMISSIONER_FW_VERSION     3
+
 // --- Router Joiner (device-side commissioning) ---
 // Used when a device boots WITHOUT an operational dataset and is NOT the
 // designated network former. It scans for the network and joins via the

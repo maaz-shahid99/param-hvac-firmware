@@ -11,6 +11,7 @@
 #include "openthread/thread.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,9 @@ static cfg_blob_t    s_pending;
 
 static otUdpSocket s_sock;
 static bool        s_sock_open = false;
+
+// Last fleet-OTA nonce we acted on (dedup so we relay each broadcast once).
+static uint32_t s_last_ota_nonce = 0;
 
 // ---- HMAC-SHA256 over a string -> 64-char lowercase hex ----------------
 static void compute_hmac_hex(const char *msg, char out_hex[65])
@@ -247,6 +251,40 @@ static void cfg_recv_cb(void *ctx, otMessage *msg, const otMessageInfo *info)
         return;
     }
 
+    // Fleet-OTA command: "OTA|<nonce>|<baseurl>|<hmac>"
+    if (strncmp(buf, "OTA|", 4) == 0) {
+        const char *last = strrchr(buf, '|');
+        if (!last) return;
+        size_t signed_len = (size_t)(last - buf);
+        if (signed_len == 0 || signed_len >= CFG_MSG_MAX) return;
+
+        char signed_part[CFG_MSG_MAX];
+        memcpy(signed_part, buf, signed_len);
+        signed_part[signed_len] = '\0';
+
+        char expect[65];
+        compute_hmac_hex(signed_part, expect);
+        if (!hmac_equal(last + 1, expect)) { ESP_LOGW(TAG, "Rejected OTA: bad signature"); return; }
+
+        // Parse nonce + baseurl from the verified part.
+        char work[CFG_MSG_MAX];
+        strncpy(work, signed_part, sizeof(work) - 1); work[sizeof(work) - 1] = '\0';
+        char *save = NULL;
+        strtok_r(work, "|", &save);                 // "OTA"
+        char *nonce_s = strtok_r(NULL, "|", &save);
+        char *baseurl = strtok_r(NULL, "|", &save);
+        if (!nonce_s || !baseurl) return;
+
+        uint32_t nonce = (uint32_t)strtoul(nonce_s, NULL, 10);
+        if (nonce == s_last_ota_nonce) return;       // already relayed this one
+        s_last_ota_nonce = nonce;
+
+        ESP_LOGW(TAG, "Fleet OTA command accepted -> %s", baseurl);
+        printf("OTA_NOW %s\n", baseurl);             // tell our C3 to self-update
+        fflush(stdout);
+        return;
+    }
+
     if (strncmp(buf, "CFG|", 4) != 0) return;
 
     cfg_blob_t incoming;
@@ -267,6 +305,7 @@ static void signal_gateway_role_locked(void)
     otInstance *inst = esp_openthread_get_instance();
     bool is_leader = (otThreadGetDeviceRole(inst) == OT_DEVICE_ROLE_LEADER);
     printf("GW_ROLE %s\n", is_leader ? "LEADER" : "STANDBY");
+    printf("C6_VERSION %d\n", COMMISSIONER_FW_VERSION);   // so the C3 can version-gate fleet OTA
     fflush(stdout);
 }
 
@@ -389,4 +428,33 @@ void config_sync_publish_local(const char *ssid, const char *pass,
     } else {
         ESP_LOGW(TAG, "publish: socket not ready / lock busy (stored locally, will announce when Leader)");
     }
+}
+
+void config_sync_broadcast_ota(const char *baseurl)
+{
+    if (!baseurl || !baseurl[0]) return;
+
+    uint32_t nonce = esp_random();
+    char signed_part[CFG_MSG_MAX];
+    int n = snprintf(signed_part, sizeof(signed_part), "OTA|%lu|%s",
+                     (unsigned long)nonce, baseurl);
+    if (n < 0 || n >= (int)sizeof(signed_part)) return;
+
+    char sig[65];
+    compute_hmac_hex(signed_part, sig);
+
+    char payload[CFG_MSG_MAX];
+    if (snprintf(payload, sizeof(payload), "%s|%s", signed_part, sig) >= (int)sizeof(payload)) return;
+
+    // Mesh-wide: every other node verifies + relays OTA_NOW to its C3.
+    if (s_sock_open && esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) {
+        send_multicast_locked(payload);
+        esp_openthread_lock_release();
+        ESP_LOGW(TAG, "Broadcast fleet OTA -> %s", baseurl);
+    }
+
+    // The sender doesn't receive its own multicast, so trigger our own C3 too.
+    s_last_ota_nonce = nonce;
+    printf("OTA_NOW %s\n", baseurl);
+    fflush(stdout);
 }

@@ -96,6 +96,16 @@ static void process_command(char *raw_input) {
         return;
     }
 
+    // C3 -> C6: broadcast a fleet-OTA command (signed) over the mesh.
+    // Format: "ota_broadcast <baseurl>"  e.g. "ota_broadcast http://10.14.98.109:8001"
+    if (token && strcmp(token, "ota_broadcast") == 0) {
+        const char *url = raw_input + strlen("ota_broadcast");
+        while (*url == ' ') url++;
+        if (*url) config_sync_broadcast_ota(url);
+        free(cmd_copy);
+        return;
+    }
+
     // C3 -> C6: locally-provisioned Wi-Fi/app creds to replicate across the mesh.
     // Format: "cfg_publish <ssid>|<pass>|<zone>|<net>|<pin>"  (fields must not
     // contain '|'; <pin> is "-" to leave the fleet PIN unchanged)
