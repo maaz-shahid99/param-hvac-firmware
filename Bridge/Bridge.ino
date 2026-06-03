@@ -85,6 +85,7 @@ void deinitBLE();
 static bool bleShouldAdvertise();
 static void updateBleAdvertising();
 static void forwardReading(const String &eui, const String &data);
+static void forwardReadingCloud(const String &eui, const String &data);
 
 // --- Discovery / data-forwarding to the display node ---
 // The cloud discovery server address is fixed infrastructure baked into the
@@ -93,6 +94,15 @@ static void forwardReading(const String &eui, const String &data);
 #define DEFAULT_DISCOVERY_URL "http://10.14.98.109:8000"   // <-- set to your discovery server
 static String   g_discoveryUrl = DEFAULT_DISCOVERY_URL;
 static String   g_nodeUrl      = "";                        // discovered display node e.g. http://192.168.1.60:8001
+
+// --- Cloud alerting service (AWS) ---
+// Readings are ALSO posted here (in addition to the LAN display node) so the
+// cloud threshold engine can alert the customer when racks overheat. Both the
+// base URL and the per-site API key are provisioned over BLE (PROVISION payload
+// "cloud"/"cloudKey" fields) and stored in NVS. Empty key => cloud POST skipped.
+#define DEFAULT_CLOUD_URL ""                                // e.g. https://api.yourdomain.com
+static String   g_cloudUrl     = DEFAULT_CLOUD_URL;
+static String   g_cloudKey     = "";                        // X-API-Key -> tenant on the cloud
 static uint32_t g_lastDiscover = 0;
 static uint32_t g_lastBeat     = 0;
 static const uint32_t DISCOVER_INTERVAL_MS = 10000;
@@ -188,6 +198,8 @@ void handleProvisioning(const String &jsonPayload) {
   const char *zone = doc["zone"];
   const char *netName = doc["netName"];
   const char *disc = doc["disc"];        // optional: discovery server URL override
+  const char *cloud = doc["cloud"];      // optional: cloud alerting service base URL
+  const char *cloudKey = doc["cloudKey"];// optional: per-site cloud API key
 
   if (!ssid || !pass || !netName) {
     bleNotifyLine("ERR MISSING_FIELDS");
@@ -205,6 +217,14 @@ void handleProvisioning(const String &jsonPayload) {
   if (disc && strlen(disc) > 0) {
     preferences.putString("disc", disc);
     g_discoveryUrl = disc;
+  }
+  if (cloud && strlen(cloud) > 0) {
+    preferences.putString("cloud", cloud);
+    g_cloudUrl = cloud;
+  }
+  if (cloudKey && strlen(cloudKey) > 0) {
+    preferences.putString("cloudKey", cloudKey);
+    g_cloudKey = cloudKey;
   }
   preferences.end();
 
@@ -405,6 +425,28 @@ static void forwardReading(const String &eui, const String &data) {
   } else {
     Serial.printf("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
     g_nodeUrl = "";   // node unreachable -> force a re-discover
+  }
+  forwardReadingCloud(eui, data);
+}
+
+// --- Also forward the reading to the cloud alerting service (AWS), if set ---
+// Independent of the LAN path: a cloud failure must NOT disturb g_nodeUrl, and a
+// missing cloud config simply skips this (LAN dashboard keeps working alone).
+static void forwardReadingCloud(const String &eui, const String &data) {
+  if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
+  HTTPClient http;
+  http.setConnectTimeout(2000);
+  http.setTimeout(2000);
+  if (!http.begin(g_cloudUrl + "/v1/readings")) return;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", g_cloudKey);
+  String body = String("{\"sensor_id\":\"") + eui + "\",\"data\":\"" + data + "\"}";
+  int code = http.POST(body);
+  http.end();
+  if (code > 0) {
+    Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
+  } else {
+    Serial.printf("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
   }
 }
 
@@ -1184,9 +1226,16 @@ void setup() {
   String savedSSID = preferences.getString("ssid", "");
   String savedPass = preferences.getString("pass", "");
   String savedDisc = preferences.getString("disc", "");
+  String savedCloud = preferences.getString("cloud", "");
+  String savedCloudKey = preferences.getString("cloudKey", "");
   preferences.end();
   if (savedDisc.length() > 0) g_discoveryUrl = savedDisc;
+  if (savedCloud.length() > 0) g_cloudUrl = savedCloud;
+  if (savedCloudKey.length() > 0) g_cloudKey = savedCloudKey;
   Serial.printf("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
+  Serial.printf("[BOOT] Cloud alerting: %s (key %s)\n",
+                g_cloudUrl.isEmpty() ? "(none)" : g_cloudUrl.c_str(),
+                g_cloudKey.isEmpty() ? "unset" : "set");
 
   if (savedSSID.length() > 0) {
     // Do NOT auto-connect here. Wi-Fi is brought up only when the C6 signals

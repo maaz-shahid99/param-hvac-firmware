@@ -30,14 +30,18 @@ commands are HMAC-signed and verified against the session. Locally-handled
 commands tolerate the signature via `stripTrailingSig()`.
 
 ### 3. Provisioning & credential replication
-- `PROVISION|{ssid,pass,zone,netName,disc}` -> stores creds, switches AP cleanly,
-  optional `disc` overrides the discovery-server URL.
+- `PROVISION|{ssid,pass,zone,netName,disc,cloud,cloudKey}` -> stores creds,
+  switches AP cleanly. Optional `disc` overrides the discovery-server URL;
+  optional `cloud`/`cloudKey` set the AWS alerting service base URL + per-site
+  API key (persisted in NVS).
 - Receives mesh-replicated Wi-Fi creds + admin PIN from the C6 (`CFG_SET`) so one
   provisioning propagates fleet-wide; standby units hold them in NVS.
 
 ### 4. Sensor data pipeline
 - Parses the C6's `[UDP_RX] ... EUI=<hex>;t=<csv>` lines and `forwardReading()`s
-  them to the display node `/ingest`.
+  them to the display node `/ingest` **and** (if provisioned) to the AWS Cloud
+  Server `/v1/readings` with the `X-API-Key` (`[CLOUD]` log line) for overheat
+  alerting — the LAN path is unaffected if the cloud is unreachable.
 - Tracks recently-seen sensor EUIs and answers **`NODES?`** (`NODES_BEGIN` /
   `NODE|<eui>` / `NODES_END`) so the app can offer a live-device dropdown.
 - `MAP|<eui>|<box>|<slot>|<label>` -> `registerSensorMap()` POSTs the
