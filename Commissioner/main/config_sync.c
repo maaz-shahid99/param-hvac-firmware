@@ -55,8 +55,9 @@ static cfg_blob_t    s_pending;
 static otUdpSocket s_sock;
 static bool        s_sock_open = false;
 
-// Last fleet-OTA nonce we acted on (dedup so we relay each broadcast once).
+// Last fleet-OTA / fleet-reset nonce we acted on (dedup: relay each once).
 static uint32_t s_last_ota_nonce = 0;
+static uint32_t s_last_reset_nonce = 0;
 
 // ---- HMAC-SHA256 over a string -> 64-char lowercase hex ----------------
 static void compute_hmac_hex(const char *msg, char out_hex[65])
@@ -285,6 +286,31 @@ static void cfg_recv_cb(void *ctx, otMessage *msg, const otMessageInfo *info)
         return;
     }
 
+    // Fleet factory-reset command: "RESET|<nonce>|<hmac>"
+    if (strncmp(buf, "RESET|", 6) == 0) {
+        const char *last = strrchr(buf, '|');
+        if (!last) return;
+        size_t signed_len = (size_t)(last - buf);
+        if (signed_len == 0 || signed_len >= CFG_MSG_MAX) return;
+
+        char signed_part[CFG_MSG_MAX];
+        memcpy(signed_part, buf, signed_len);
+        signed_part[signed_len] = '\0';
+
+        char expect[65];
+        compute_hmac_hex(signed_part, expect);
+        if (!hmac_equal(last + 1, expect)) { ESP_LOGW(TAG, "Rejected RESET: bad signature"); return; }
+
+        uint32_t nonce = (uint32_t)strtoul(signed_part + 6, NULL, 10);   // after "RESET|"
+        if (nonce == s_last_reset_nonce) return;
+        s_last_reset_nonce = nonce;
+
+        ESP_LOGW(TAG, "Fleet factory-reset command accepted");
+        printf("RESET_NOW\n");                        // tell our C3 to wipe + reboot
+        fflush(stdout);
+        return;
+    }
+
     if (strncmp(buf, "CFG|", 4) != 0) return;
 
     cfg_blob_t incoming;
@@ -456,5 +482,30 @@ void config_sync_broadcast_ota(const char *baseurl)
     // The sender doesn't receive its own multicast, so trigger our own C3 too.
     s_last_ota_nonce = nonce;
     printf("OTA_NOW %s\n", baseurl);
+    fflush(stdout);
+}
+
+void config_sync_broadcast_reset(void)
+{
+    uint32_t nonce = esp_random();
+    char signed_part[CFG_MSG_MAX];
+    int n = snprintf(signed_part, sizeof(signed_part), "RESET|%lu", (unsigned long)nonce);
+    if (n < 0 || n >= (int)sizeof(signed_part)) return;
+
+    char sig[65];
+    compute_hmac_hex(signed_part, sig);
+
+    char payload[CFG_MSG_MAX];
+    if (snprintf(payload, sizeof(payload), "%s|%s", signed_part, sig) >= (int)sizeof(payload)) return;
+
+    if (s_sock_open && esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) {
+        send_multicast_locked(payload);
+        esp_openthread_lock_release();
+        ESP_LOGW(TAG, "Broadcast fleet factory-reset");
+    }
+
+    // The sender doesn't receive its own multicast, so trigger our own C3 too.
+    s_last_reset_nonce = nonce;
+    printf("RESET_NOW\n");
     fflush(stdout);
 }

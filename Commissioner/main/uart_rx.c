@@ -106,6 +106,13 @@ static void process_command(char *raw_input) {
         return;
     }
 
+    // C3 -> C6: broadcast a signed fleet factory-reset over the mesh.
+    if (token && strcmp(token, "reset_broadcast") == 0) {
+        config_sync_broadcast_reset();
+        free(cmd_copy);
+        return;
+    }
+
     // C3 -> C6: locally-provisioned Wi-Fi/app creds to replicate across the mesh.
     // Format: "cfg_publish <ssid>|<pass>|<zone>|<net>|<pin>"  (fields must not
     // contain '|'; <pin> is "-" to leave the fleet PIN unchanged)

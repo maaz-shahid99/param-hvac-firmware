@@ -46,3 +46,12 @@ void config_sync_publish_local(const char *ssid, const char *pass,
  * gateway updates too). @param baseurl e.g. "http://10.14.98.109:8001".
  */
 void config_sync_broadcast_ota(const char *baseurl);
+
+/**
+ * @brief Broadcast a signed fleet factory-reset command over the mesh.
+ *
+ * Sends "RESET|<nonce>|<hmac>" to the mesh-local all-nodes group. Every node
+ * verifies it and relays "RESET_NOW" to its own C3, which wipes NVS on both
+ * chips and reboots. Also triggers the local C3 (so the gateway resets too).
+ */
+void config_sync_broadcast_reset(void);

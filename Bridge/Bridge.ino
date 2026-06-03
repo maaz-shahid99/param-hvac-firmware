@@ -9,7 +9,7 @@
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 7
+#define BRIDGE_FW_VERSION 9
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
 #include "logger.h"
@@ -98,6 +98,18 @@ static uint32_t g_lastBeat     = 0;
 static const uint32_t DISCOVER_INTERVAL_MS = 10000;
 static const uint32_t BEAT_INTERVAL_MS     = 10000;
 
+// --- Live "seen" sensor table -------------------------------------------------
+// Populated from the [UDP_RX] EUI stream we already relay to the display node.
+// Answers the app's "NODES?" query so it can offer a dropdown of live sensors
+// instead of making the operator type a 16-hex EUI by hand. Mesh-wide, because
+// every sensor reading routes to the gateway regardless of which router it
+// attached to.
+struct SeenNode { String eui; uint32_t lastMs; };
+static const int      SEEN_MAX        = 64;
+static const uint32_t SEEN_WINDOW_MS  = 300000;   // 5 min "live" window
+static SeenNode       g_seen[SEEN_MAX];
+static void noteSeenEui(const String &eui);
+
 // OTA is requested from the BLE task but RUN from loop() so that Serial1 has a
 // single reader during the C6 transfer. 0=none, 1=check/self-update C3, 2=push C6.
 volatile int g_pendingOta = 0;
@@ -111,6 +123,12 @@ bool     g_fleetOtaPending = false;
 String   g_fleetOtaBaseUrl;
 uint32_t g_fleetOtaAt      = 0;
 static void performFleetOta(const String &baseurl);
+
+// Latest commissioner state, tracked from the C6's "COMMISSIONER STATE UPDATE"
+// lines, reported to the app via SYS?.  0=unknown, 1=active, 2=disabled.
+int g_commState = 0;
+volatile bool g_pendingReset = false;   // FACTORY_RESET requested from the BLE task
+static void doFactoryReset();
 
 // Pending command tracking
 static bool g_pendingAdd = false;
@@ -390,8 +408,24 @@ static void forwardReading(const String &eui, const String &data) {
   }
 }
 
+// --- Record that we just heard from a sensor EUI (for the NODES? dropdown) ---
+static void noteSeenEui(const String &eui) {
+  if (eui.isEmpty()) return;
+  uint32_t now = millis();
+  int oldest = 0;
+  for (int i = 0; i < SEEN_MAX; i++) {
+    if (g_seen[i].eui == eui) { g_seen[i].lastMs = now; return; }   // refresh
+    if (g_seen[i].eui.isEmpty()) { g_seen[i].eui = eui; g_seen[i].lastMs = now; return; }
+    if (g_seen[i].lastMs < g_seen[oldest].lastMs) oldest = i;       // track LRU
+  }
+  g_seen[oldest].eui = eui;                                          // table full -> evict LRU
+  g_seen[oldest].lastMs = now;
+}
+
 // --- Register an EUI -> box/slot mapping on the display node (commissioning) ---
-static bool registerSensorMap(const String &eui, int box, const String &slot) {
+// `label` is the human-readable location (e.g. "Rack A / Unit 1 / Intake 1");
+// the box/slot fields stay so the legacy 3D box-grid dashboard keeps working.
+static bool registerSensorMap(const String &eui, int box, const String &slot, const String &label) {
   if (g_nodeUrl.isEmpty()) discoverNode();
   if (g_nodeUrl.isEmpty()) return false;
   HTTPClient http;
@@ -399,7 +433,8 @@ static bool registerSensorMap(const String &eui, int box, const String &slot) {
   http.setTimeout(2000);
   if (!http.begin(g_nodeUrl + "/map")) return false;
   http.addHeader("Content-Type", "application/json");
-  String body = String("{\"eui\":\"") + eui + "\",\"box\":" + String(box) + ",\"slot\":\"" + slot + "\"}";
+  String body = String("{\"eui\":\"") + eui + "\",\"box\":" + String(box) +
+                ",\"slot\":\"" + slot + "\",\"label\":\"" + label + "\"}";
   int code = http.POST(body);
   http.end();
   return code == 200;
@@ -626,6 +661,20 @@ static void performFleetOta(const String &baseurl) {
   Serial.println("[FLEETOTA] complete (or already up-to-date)");
 }
 
+// Wipe this unit (C3 NVS + tell the C6 to wipe) and reboot.
+static void doFactoryReset() {
+  Serial.println("\n[SYSTEM] === FACTORY RESET INITIATED ===");
+  nvs_flash_erase();
+  nvs_flash_init();
+  Serial1.println("factory_reset");      // wipe the C6 too (matches its UART command)
+  Serial1.flush();
+  Serial.println("[SYSTEM] NVS cleared + Commissioner reset sent. Rebooting...");
+  deinitBLE();
+  WiFi.disconnect(true);
+  delay(2000);
+  ESP.restart();
+}
+
 // --- Parsing Pending Adds ---
 static void parsePendingFromCommand(const String &cmdLine) {
   String line = cmdLine;
@@ -668,6 +717,16 @@ static void handleCommissionerLine(const String &line) {
     g_c6Version = line.substring(11).toInt();
     return;
   }
+  // Fleet factory-reset relayed from the mesh by our C6 -> wipe + reboot.
+  if (line.startsWith("RESET_NOW")) {
+    doFactoryReset();   // does not return
+    return;
+  }
+  // Track commissioner state (for SYS?) from the C6's status lines.
+  if (line.indexOf("COMMISSIONER STATE UPDATE") >= 0) {
+    if (line.indexOf("ACTIVE") >= 0)        g_commState = 1;
+    else if (line.indexOf("DISABLED") >= 0) g_commState = 2;
+  }
   // Fleet OTA trigger relayed from the mesh by our C6. Schedule it staggered
   // (gateway goes last) so the whole fleet doesn't reboot simultaneously.
   if (line.startsWith("OTA_NOW ")) {
@@ -697,6 +756,7 @@ static void handleCommissionerLine(const String &line) {
         if (semi > 4) {
           String eui  = payload.substring(4, semi);
           String data = payload.substring(semi + 1);    // "t=23.1,24.0,..."
+          noteSeenEui(eui);                             // track as a live device
           forwardReading(eui, data);
         }
       }
@@ -913,22 +973,41 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     // appends "|<hmac>"); strip it — the authenticated session is the gate here.
     String sCmd = stripTrailingSig(cmdLine);
 
-    // A2. MAP — assign a sensor's EUI to a physical box/slot at commissioning.
-    //     Format: "MAP|<EUI16hex>|<box>|<slot>"  e.g. "MAP|58e6c5fffe164ec0|3|A"
-    //     Forwarded to the display node (the central EUI->box/slot table).
+    // A1. NODES? — reply with the live sensor EUIs we've recently seen so the
+    //     app can offer a device dropdown. Chunked to survive the BLE MTU.
+    if (sCmd == "NODES?") {
+      bleNotifyLine("NODES_BEGIN");
+      uint32_t now = millis();
+      for (int i = 0; i < SEEN_MAX; i++) {
+        if (!g_seen[i].eui.isEmpty() && (now - g_seen[i].lastMs) < SEEN_WINDOW_MS) {
+          bleNotifyLine("NODE|" + g_seen[i].eui);
+        }
+      }
+      bleNotifyLine("NODES_END");
+      return;
+    }
+
+    // A2. MAP — assign a sensor's EUI to a physical location at commissioning.
+    //     Format: "MAP|<EUI16hex>|<box>|<slot>[|<label>]"
+    //       e.g. "MAP|58e6c5fffe164ec0|3|A|Rack A / Unit 1 / Intake 1"
+    //     box/slot drive the legacy dashboard grid; label is the rich location.
+    //     Forwarded to the display node (the central EUI->location table).
     if (sCmd.startsWith("MAP|")) {
       int p1 = sCmd.indexOf('|');
       int p2 = sCmd.indexOf('|', p1 + 1);
       int p3 = sCmd.indexOf('|', p2 + 1);
       if (p1 > 0 && p2 > p1 && p3 > p2) {
-        String eui  = sCmd.substring(p1 + 1, p2);
-        int    box  = sCmd.substring(p2 + 1, p3).toInt();
-        String slot = sCmd.substring(p3 + 1);
+        int p4 = sCmd.indexOf('|', p3 + 1);             // optional 4th field
+        String eui   = sCmd.substring(p1 + 1, p2);
+        int    box   = sCmd.substring(p2 + 1, p3).toInt();
+        String slot  = (p4 > p3) ? sCmd.substring(p3 + 1, p4) : sCmd.substring(p3 + 1);
+        String label = (p4 > p3) ? sCmd.substring(p4 + 1) : "";
         eui.toLowerCase();
         slot.toUpperCase();
-        bool ok = registerSensorMap(eui, box, slot);
+        bool ok = registerSensorMap(eui, box, slot, label);
         bleNotifyLine(ok ? "ACK MAP " + eui : "ERR MAP NODE_UNREACHABLE");
-        Serial.printf("[MAP] %s -> box%d-%s (%s)\n", eui.c_str(), box, slot.c_str(), ok ? "ok" : "failed");
+        Serial.printf("[MAP] %s -> box%d-%s (%s) %s\n",
+                      eui.c_str(), box, slot.c_str(), ok ? "ok" : "failed", label.c_str());
       } else {
         bleNotifyLine("ERR MAP FORMAT");
       }
@@ -947,6 +1026,42 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       Serial1.flush();
       bleNotifyLine("OTA_FLEET BROADCASTING");
       Serial.println("[FLEETOTA] broadcast requested -> " + g_nodeUrl);
+      return;
+    }
+
+    // A6. OTA_SELF — update THIS unit (C6 then C3), reusing the fleet scheduler.
+    if (sCmd == "OTA_SELF") {
+      if (g_nodeUrl.isEmpty()) { bleNotifyLine("ERR OTA NO_NODE"); return; }
+      g_fleetOtaBaseUrl = g_nodeUrl;
+      g_fleetOtaAt      = millis();
+      g_fleetOtaPending = true;
+      bleNotifyLine("OTA_SELF QUEUED");
+      return;
+    }
+
+    // A7. SYS? — report this unit's status to the app.
+    if (sCmd == "SYS?") {
+      String s = "SYS|role=";
+      s += (isActiveGateway ? "LEADER" : "STANDBY");
+      s += "|c3="  + String(BRIDGE_FW_VERSION);
+      s += "|c6="  + String(g_c6Version);
+      s += "|comm=" + String(g_commState == 1 ? "ACTIVE" : (g_commState == 2 ? "DISABLED" : "?"));
+      s += "|wifi=" + String(WiFi.status() == WL_CONNECTED ? 1 : 0);
+      s += "|node=" + String(g_nodeUrl.isEmpty() ? 0 : 1);
+      bleNotifyLine(s);
+      return;
+    }
+
+    // A8. FACTORY_RESET — wipe this unit. RESET_FLEET — wipe the whole fleet.
+    if (sCmd == "FACTORY_RESET") {
+      bleNotifyLine("FACTORY_RESET OK");
+      g_pendingReset = true;            // run from loop() (not the BLE callback)
+      return;
+    }
+    if (sCmd == "RESET_FLEET") {
+      Serial1.println("reset_broadcast");   // C6 signs + multicasts; each unit wipes
+      Serial1.flush();
+      bleNotifyLine("RESET_FLEET BROADCASTING");
       return;
     }
 
@@ -1092,25 +1207,7 @@ void loop() {
       resetBtnPressTime = millis();
       Serial.println("[SYSTEM] Reset button pressed. Hold for 1s to factory reset...");
     } else if (millis() - resetBtnPressTime >= 10000) {
-      // Button held for 1 second
-      Serial.println("\n[SYSTEM] === FACTORY RESET INITIATED ===");
-
-      // 1. Wipe the ESP32 Bridge NVS
-      nvs_flash_erase();
-      nvs_flash_init();
-
-      // 2. Wipe the Commissioner via UART
-      Serial1.println("factoryreset");
-      Serial1.flush();
-
-      Serial.println("[SYSTEM] NVS Cleared and Commissioner Reset command sent.");
-      Serial.println("[SYSTEM] Rebooting in 2 seconds...\n");
-
-      // 3. Disconnect and Restart gracefully
-      deinitBLE();
-      WiFi.disconnect(true);
-      delay(2000);
-      ESP.restart();
+      doFactoryReset();   // wipe C3 + C6 and reboot (does not return)
     }
   } else {
     if (resetBtnPressed) {
@@ -1136,6 +1233,12 @@ void loop() {
     g_fleetOtaPending = false;
     Serial.println("[FLEETOTA] starting self-update...");
     performFleetOta(g_fleetOtaBaseUrl);
+  }
+
+  // 0d. Factory reset requested over BLE — run from loop() then reboot.
+  if (g_pendingReset) {
+    g_pendingReset = false;
+    doFactoryReset();   // does not return
   }
 
   // 1. Switch Logic
