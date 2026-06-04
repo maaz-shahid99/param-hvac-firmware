@@ -411,19 +411,22 @@ static void announce_identity_locked(void)
     send_multicast_locked(payload);
 }
 
-// ---- Leader: report the mesh-node roster to the local C3 ---------------
+// ---- Report the mesh-node roster to the local C3 (every node) ----------
 // Emits "MESH_NODE <eui> <G|R>" for every live C6 node (ourself + peers heard
 // via IDENT). Uses the REAL factory EUI-64 (matches commissioning + sensor
 // readings). Sensors are not C6 nodes — they're tracked separately via NODES?.
-// On failover this just works: whoever is leader prints itself as G.
+// EVERY node reports (not just the leader) so the app sees the roster no matter
+// which gateway it's connected to (the commissioner isn't always the leader).
+// We report ourself with our ACTUAL role; the leader's 'G' reaches everyone via
+// its IDENT, so failover just works.
 static void report_roster_locked(void)
 {
     otInstance *inst = esp_openthread_get_instance();
-    if (otThreadGetDeviceRole(inst) != OT_DEVICE_ROLE_LEADER) return;  // only the gateway reports
+    bool leader = (otThreadGetDeviceRole(inst) == OT_DEVICE_ROLE_LEADER);
 
     char self_eui[17];
     own_eui64(self_eui);
-    printf("MESH_NODE %s G\n", self_eui);          // the active gateway = us
+    printf("MESH_NODE %s %c\n", self_eui, leader ? 'G' : 'R');   // self, actual role
 
     uint32_t now = ms_now();
     for (int i = 0; i < ROSTER_MAX; i++) {

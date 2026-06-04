@@ -903,7 +903,7 @@ static void handleCommissionerLine(const String &line) {
   // Extract the sensor EUI + temps and forward to the display node /ingest.
   if (line.indexOf("[UDP_RX]") >= 0) {
     int arrow = line.indexOf("-> ");
-    if (arrow >= 0 && isActiveGateway) {
+    if (arrow >= 0) {
       String payload = line.substring(arrow + 3);
       payload.trim();                                   // "EUI=<hex>;t=..."
       if (payload.startsWith("EUI=")) {
@@ -911,8 +911,11 @@ static void handleCommissionerLine(const String &line) {
         if (semi > 4) {
           String eui  = payload.substring(4, semi);
           String data = payload.substring(semi + 1);    // "t=23.1,24.0,..."
-          noteSeenEui(eui);                             // track as a live device
-          forwardReading(eui, data);
+          // Track the sensor on ANY gateway that hears it (the app may connect
+          // to the commissioner, which isn't always the active leader) so NODES?
+          // is never empty. Only the ACTIVE gateway forwards (avoids duplicates).
+          noteSeenEui(eui);
+          if (isActiveGateway) forwardReading(eui, data);
         }
       }
     }
