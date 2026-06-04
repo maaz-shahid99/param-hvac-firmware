@@ -1102,11 +1102,21 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
+    // Strip any trailing "|<hmac>" so we can recognise the command for gating.
+    // (Commands handled locally on the C3 — MAP, OTA — may arrive signed.)
+    String sCmd = stripTrailingSig(cmdLine);
+
+    // Read-only STATUS queries are allowed WITHOUT authentication: they expose
+    // only device lists / status (sensor + mesh EUIs, roles, versions, link
+    // state) — no secrets, no control — so the app can populate its Devices view
+    // and the assign dropdown the moment it connects, even before unlocking.
+    bool isReadOnlyQuery = (sCmd == "NODES?" || sCmd == "ROUTERS?" || sCmd == "SYS?");
+
     // ==========================================
     // 3. THE GATEKEEPER
     // ==========================================
-    // Any commands beyond this point require the session to be authenticated.
-    if (!isSessionAuthenticated) {
+    // Everything that changes state requires an authenticated session.
+    if (!isSessionAuthenticated && !isReadOnlyQuery) {
       Serial.println("[BLE] Rejected write (App-Level Unauthenticated)");
       bleNotifyLine("ERR UNAUTHENTICATED");
       return;
@@ -1123,10 +1133,6 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       handleProvisioning(jsonPart);
       return;
     }
-
-    // Commands handled locally on the C3 (MAP, OTA) may arrive signed (the app
-    // appends "|<hmac>"); strip it — the authenticated session is the gate here.
-    String sCmd = stripTrailingSig(cmdLine);
 
     // A1. NODES? — reply with the live sensor EUIs we've recently seen so the
     //     app can offer a device dropdown. Chunked to survive the BLE MTU.
