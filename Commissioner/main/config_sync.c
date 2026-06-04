@@ -106,7 +106,11 @@ static void nvs_load(void)
     n = sizeof(s_cfg.pin);  if (nvs_get_str(h, "pin",  s_cfg.pin,  &n) != ESP_OK) strcpy(s_cfg.pin, CFG_PIN_NONE);
     nvs_close(h);
 
+#if LOG_SENSITIVE
     ESP_LOGI(TAG, "Loaded config v%lu (ssid='%s', net='%s')", (unsigned long)s_cfg.version, s_cfg.ssid, s_cfg.net);
+#else
+    ESP_LOGI(TAG, "Loaded config v%lu", (unsigned long)s_cfg.version);
+#endif
 }
 
 static void nvs_store(const cfg_blob_t *c)
@@ -355,7 +359,11 @@ static void config_sync_task(void *arg)
             s_cfg = c;
             nvs_store(&c);
             relay_to_c3(&c);
+#if LOG_SENSITIVE
             ESP_LOGI(TAG, "Applied config v%lu (ssid='%s')", (unsigned long)c.version, c.ssid);
+#else
+            ESP_LOGI(TAG, "Applied config v%lu", (unsigned long)c.version);
+#endif
         }
 
         // 2) Periodically re-signal our gateway role to the C3.

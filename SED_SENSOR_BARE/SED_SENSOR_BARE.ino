@@ -2,6 +2,7 @@
 #include <OThread.h>
 #include "esp_mac.h"
 #include <nvs_flash.h>
+#include <nvs.h>
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 
@@ -23,8 +24,21 @@
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
 
-// Your secure passphrase
-const char *pskd = "J01NME";
+// Join passphrase (PSKd). PRODUCTION: provision a UNIQUE value per device into
+// NVS (namespace "factory", key "pskd") at the bench/factory and print it on the
+// unit's QR label; the commissioner must `add <EUI> <that PSKd>`. If NVS has no
+// value we fall back to this build default so dev boards still join.
+char g_pskd[33] = "J01NME";
+
+// Load a per-device PSKd from NVS if one was provisioned (else keep the default).
+static void load_pskd_from_nvs() {
+  nvs_handle_t h;
+  if (nvs_open("factory", NVS_READONLY, &h) == ESP_OK) {
+    size_t n = sizeof(g_pskd);
+    nvs_get_str(h, "pskd", g_pskd, &n);   // leaves g_pskd unchanged on ESP_ERR_NVS_NOT_FOUND
+    nvs_close(h);
+  }
+}
 
 // Factory EUI-64 (hex), used to tag every UDP payload so the gateway/host can
 // map this physical sensor to its rack box/slot. Set once in setup().
@@ -62,7 +76,7 @@ static void start_joiner_locked(otInstance *inst) {
   otJoinerStop(inst);
 
   otError err = otJoinerStart(
-    inst, pskd, NULL, "MyVendor", "MySensor", "1.0.0", NULL, otaJoinerCallback, NULL);
+    inst, g_pskd, NULL, "MyVendor", "MySensor", "1.0.0", NULL, otaJoinerCallback, NULL);
 
   if (err != OT_ERROR_NONE) {
     Serial.printf("[JOINER] WARNING: Joiner failed to initialize! Error: %d\n", err);
@@ -93,6 +107,9 @@ void setup() {
   } else {
       Serial.println("[SYSTEM] NVS Partition mounted successfully.");
   }
+
+  // Load a per-device join PSKd if one was provisioned at the factory.
+  load_pskd_from_nvs();
 
   // Capture our factory EUI-64 once (hex), for tagging UDP payloads.
   {

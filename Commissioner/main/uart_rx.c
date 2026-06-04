@@ -96,6 +96,17 @@ static void process_command(char *raw_input) {
         return;
     }
 
+    // C3 -> C6: wipe this Commissioner. This arrives ONLY over the local UART
+    // from the paired Bridge (which gated it behind the authenticated BLE
+    // session, or behind an HMAC-verified mesh RESET). It is therefore a
+    // trusted-link command and is intentionally NOT on the signed `add` path.
+    if (token && strcmp(token, "factory_reset") == 0) {
+        free(cmd_copy);
+        nvs_flash_erase();
+        esp_restart();
+        return;  // unreachable
+    }
+
     // C3 -> C6: broadcast a fleet-OTA command (signed) over the mesh.
     // Format: "ota_broadcast <baseurl>"  e.g. "ota_broadcast http://10.14.98.109:8001"
     if (token && strcmp(token, "ota_broadcast") == 0) {
@@ -170,12 +181,20 @@ static void process_command(char *raw_input) {
             uint32_t timeout = timeout_str ? (uint32_t)strtoul(timeout_str, NULL, 10) : 120;
             if (timeout == 0) timeout = 120;
 
+            // The PSKD is a join secret and the raw input embeds it — only log
+            // it when sensitive logging is explicitly enabled (see config.h).
+#if LOG_SENSITIVE
             ESP_LOGE(TAG, "========= PARSED VALUES =========");
             ESP_LOGE(TAG, "Raw Input: '%s'", raw_debug);
             ESP_LOGE(TAG, "EUI64    : '%s'", id_str);
             ESP_LOGE(TAG, "PSKD     : '%s'", cred);
             ESP_LOGE(TAG, "Timeout  : %lu", (unsigned long)timeout);
             ESP_LOGE(TAG, "=================================");
+#else
+            ESP_LOGI(TAG, "add: EUI=%s (PSKD redacted), timeout=%lu",
+                     id_str, (unsigned long)timeout);
+            (void)raw_debug;
+#endif
 
             // Bind this PSKD to the scanned EUI64 only — reject wildcards.
             if (strcmp(id_str, "*") == 0) {
@@ -188,10 +207,9 @@ static void process_command(char *raw_input) {
             }
         }
     }
-    else if (strcmp(token, "factory_reset") == 0) {
-        nvs_flash_erase();
-        esp_restart();
-    }
+    // NOTE: `factory_reset` is handled earlier as a trusted-link command (it
+    // arrives unsigned over UART from the local Bridge), not here on the signed
+    // path. `add` is the only command that requires an HMAC signature.
 }
 
 // --- UART Task (Unchanged Buffer Logic) ---

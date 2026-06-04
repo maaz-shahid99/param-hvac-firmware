@@ -14,6 +14,16 @@
 // so the gateway can't be MITM'd). Only used when the cloud URL is https://.
 static const char *CLOUD_ROOT_CA = "";
 
+// Set to 1 ONLY for bench debugging — gates logging of identifying creds (the
+// Wi-Fi SSID) to the serial console. MUST stay 0 in production. Passwords/PINs
+// are never logged regardless.
+#define LOG_SENSITIVE 0
+#if LOG_SENSITIVE
+  #define SSID_LOG(s) (s)
+#else
+  #define SSID_LOG(s) "<redacted>"
+#endif
+
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
 #define BRIDGE_FW_VERSION 9
@@ -213,7 +223,7 @@ void handleProvisioning(const String &jsonPayload) {
     return;
   }
 
-  Serial.printf("[PROVISION] SSID: %s, Zone: %s, NetName: %s\n", ssid, zone, netName);
+  Serial.printf("[PROVISION] SSID: %s, Zone: %s, NetName: %s\n", SSID_LOG(ssid), zone, netName);
 
   // 1. Save to NVS
   preferences.begin("gateway_config", false);
@@ -237,7 +247,7 @@ void handleProvisioning(const String &jsonPayload) {
 
   // 2. Connect to Wi-Fi (drop any prior association first so switching to a
   //    different SSID on re-provisioning is reliable).
-  Serial.printf("[WIFI] Connecting to %s...\n", ssid);
+  Serial.printf("[WIFI] Connecting to %s...\n", SSID_LOG(ssid));
   bleNotifyLine("STATUS CONNECTING_WIFI");
 
   WiFi.mode(WIFI_STA);
@@ -289,7 +299,7 @@ void handleProvisioning(const String &jsonPayload) {
 // to a different SSID reliable on the ESP32.
 static void applyWifi(const String &ssid, const String &pass) {
   if (ssid.length() == 0) return;
-  Serial.printf("[WIFI] (Re)connecting to %s...\n", ssid.c_str());
+  Serial.printf("[WIFI] (Re)connecting to %s...\n", SSID_LOG(ssid.c_str()));
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
@@ -319,7 +329,7 @@ static void handleCfgSet(const String &payload) {
   preferences.putString("net",  net);
   preferences.end();
 
-  Serial.printf("[CFG] Stored replicated creds (ssid=%s, net=%s)\n", ssid.c_str(), net.c_str());
+  Serial.printf("[CFG] Stored replicated creds (ssid=%s, net=%s)\n", SSID_LOG(ssid.c_str()), net.c_str());
 
   // Replicated admin PIN: store it so this unit accepts the same fleet PIN.
   if (pin.length() > 0 && pin != "-") {
@@ -1264,7 +1274,7 @@ void setup() {
     // GW_ROLE LEADER (this unit is the active gateway). This prevents multiple
     // units from all claiming the uplink. The C6 re-signals role every ~10s.
     Serial.printf("[BOOT] Wi-Fi creds present (SSID: %s). Waiting for GW_ROLE from Commissioner...\n",
-                  savedSSID.c_str());
+                  SSID_LOG(savedSSID.c_str()));
   }
 }
 

@@ -1,7 +1,11 @@
 #pragma once
 
 // --- Security Configuration ---
-#define SECURE_HMAC_KEY "PROD_SECRET_KEY_CHANGE_ME" // Shared with Bridge ESP32
+// Shared HMAC key that authenticates app->Commissioner commands (`add`). This
+// MUST match the key the app signs with (BLEService.defaultSecretKey).
+// PRODUCTION: change this from the placeholder and rotate the app's key in
+// lockstep (see Commissioner/deploy or DEPLOYMENT.md key-rotation note).
+#define SECURE_HMAC_KEY "PROD_SECRET_KEY_CHANGE_ME"
 #define SECURE_COMMAND_TIMEOUT_MS 5000              // Max time to acquire lock
 
 // --- System Reliability ---
@@ -9,7 +13,9 @@
 #define HEAP_WARNING_THRESHOLD      10240           // Warn if < 10KB free
 
 // --- Logging ---
-// #define CONFIG_LOG_CREDENTIALS 1                 // COMMENT OUT FOR PRODUCTION!
+// Set to 1 ONLY for bench debugging — it logs secrets (the join PSKD, creds)
+// in the clear over the console. MUST stay 0 in production.
+#define LOG_SENSITIVE 0
 
 // --- Thread Configuration ---
 #define THREAD_TASK_STACK_SIZE      8192
