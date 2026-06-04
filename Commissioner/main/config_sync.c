@@ -339,6 +339,34 @@ static void signal_gateway_role_locked(void)
     fflush(stdout);
 }
 
+// ---- Report the mesh neighbour roster to the C3 (leader/gateway only) ----
+// Emits one "MESH_NODE <eui64> <R|S>" line per Thread neighbour so the C3 can
+// answer the app's ROUTERS? query and forward router presence to the cloud.
+// Routers (full Thread devices) never send sensor readings, so this neighbour
+// table is the only place their liveness is visible. The EUI is printed as the
+// IEEE EUI-64 — the Thread extended address with the U/L bit of byte 0 flipped
+// back — so it matches the EUI used at commissioning / in sensor readings.
+// (The leader sees its directly-attached neighbours; in the small star meshes
+// we deploy, the gateway is adjacent to every router.)
+static void signal_mesh_roster_locked(void)
+{
+    otInstance *inst = esp_openthread_get_instance();
+    if (otThreadGetDeviceRole(inst) != OT_DEVICE_ROLE_LEADER) return;  // only the gateway reports
+
+    otNeighborInfoIterator it = OT_NEIGHBOR_INFO_ITERATOR_INIT;
+    otNeighborInfo info;
+    while (otThreadGetNextNeighborInfo(inst, &it, &info) == OT_ERROR_NONE) {
+        uint8_t e[8];
+        memcpy(e, info.mExtAddress.m8, sizeof(e));
+        e[0] ^= 0x02;   // Thread ext-addr -> IEEE EUI-64
+        // Full Thread device = router-capable; sleepy/MTD = sensor.
+        const char *type = info.mFullThreadDevice ? "R" : "S";
+        printf("MESH_NODE %02x%02x%02x%02x%02x%02x%02x%02x %s\n",
+               e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], type);
+    }
+    fflush(stdout);
+}
+
 // ---- Background task: convergence + role heartbeat ---------------------
 static void config_sync_task(void *arg)
 {
@@ -366,10 +394,11 @@ static void config_sync_task(void *arg)
 #endif
         }
 
-        // 2) Periodically re-signal our gateway role to the C3.
+        // 2) Periodically re-signal our gateway role + mesh roster to the C3.
         if ((tick % CFG_ROLE_EVERY) == 0) {
             if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
                 signal_gateway_role_locked();
+                signal_mesh_roster_locked();
                 esp_openthread_lock_release();
             }
         }

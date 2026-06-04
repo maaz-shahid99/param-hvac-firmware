@@ -122,8 +122,10 @@ static String   g_cloudUrl     = DEFAULT_CLOUD_URL;
 static String   g_cloudKey     = "";                        // X-API-Key -> tenant on the cloud
 static uint32_t g_lastDiscover = 0;
 static uint32_t g_lastBeat     = 0;
+static uint32_t g_lastMesh     = 0;
 static const uint32_t DISCOVER_INTERVAL_MS = 10000;
 static const uint32_t BEAT_INTERVAL_MS     = 10000;
+static const uint32_t MESH_PUSH_INTERVAL_MS = 30000;   // push router roster to cloud every 30s
 
 // --- Live "seen" sensor table -------------------------------------------------
 // Populated from the [UDP_RX] EUI stream we already relay to the display node.
@@ -136,6 +138,15 @@ static const int      SEEN_MAX        = 64;
 static const uint32_t SEEN_WINDOW_MS  = 300000;   // 5 min "live" window
 static SeenNode       g_seen[SEEN_MAX];
 static void noteSeenEui(const String &eui);
+
+// --- Live "seen" router table -------------------------------------------------
+// Populated from the C6 leader's "MESH_NODE <eui> R" roster lines. Routers don't
+// send sensor readings, so this is how we know which routers are in the mesh and
+// whether they're alive. Answers the app's "ROUTERS?" and is forwarded to the
+// cloud (/v1/mesh) so the web dashboard can show routers too.
+static const uint32_t ROUTER_WINDOW_MS = 60000;   // 1 min "online" window (roster re-sent ~10s)
+static SeenNode       g_routers[SEEN_MAX];
+static void noteSeenRouter(const String &eui);
 
 // OTA is requested from the BLE task but RUN from loop() so that Serial1 has a
 // single reader during the C6 transfer. 0=none, 1=check/self-update C3, 2=push C6.
@@ -496,6 +507,58 @@ static void noteSeenEui(const String &eui) {
   g_seen[oldest].lastMs = now;
 }
 
+// --- Record that the C6 just reported a router in the mesh (for ROUTERS?) ---
+static void noteSeenRouter(const String &eui) {
+  if (eui.isEmpty()) return;
+  uint32_t now = millis();
+  int oldest = 0;
+  for (int i = 0; i < SEEN_MAX; i++) {
+    if (g_routers[i].eui == eui) { g_routers[i].lastMs = now; return; }   // refresh
+    if (g_routers[i].eui.isEmpty()) { g_routers[i].eui = eui; g_routers[i].lastMs = now; return; }
+    if (g_routers[i].lastMs < g_routers[oldest].lastMs) oldest = i;       // track LRU
+  }
+  g_routers[oldest].eui = eui;
+  g_routers[oldest].lastMs = now;
+}
+
+// --- Forward the live router roster to the cloud (/v1/mesh), if configured ---
+// Mirrors forwardReadingCloud: routers have no readings, so the gateway POSTs
+// their presence here so the cloud (and the web dashboard) can show them.
+static void forwardMeshCloud() {
+  if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
+  if (!isActiveGateway) return;   // only the active gateway has the mesh view
+
+  uint32_t now = millis();
+  String arr; int n = 0;
+  for (int i = 0; i < SEEN_MAX; i++) {
+    if (!g_routers[i].eui.isEmpty() && (now - g_routers[i].lastMs) < ROUTER_WINDOW_MS) {
+      if (n++) arr += ",";
+      arr += String("{\"eui\":\"") + g_routers[i].eui + "\"}";
+    }
+  }
+  if (n == 0) return;   // nothing to report; cloud ages routers out by freshness
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  WiFiClientSecure secure;
+  WiFiClient       plain;
+  bool began;
+  if (g_cloudUrl.startsWith("https://")) {
+    if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA);
+    else                           secure.setInsecure();
+    began = http.begin(secure, g_cloudUrl + "/v1/mesh");
+  } else {
+    began = http.begin(plain, g_cloudUrl + "/v1/mesh");
+  }
+  if (!began) return;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", g_cloudKey);
+  int code = http.POST(String("{\"routers\":[") + arr + "]}");
+  http.end();
+  Serial.printf("[CLOUD] mesh roster (%d routers) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+}
+
 // --- Register an EUI -> box/slot mapping on the display node (commissioning) ---
 // `label` is the human-readable location (e.g. "Rack A / Unit 1 / Intake 1");
 // the box/slot fields stay so the legacy 3D box-grid dashboard keeps working.
@@ -791,6 +854,21 @@ static void handleCommissionerLine(const String &line) {
     g_c6Version = line.substring(11).toInt();
     return;
   }
+  // Mesh roster line from the C6 leader: "MESH_NODE <eui> <R|S>". Routers never
+  // send sensor readings, so this is the only place their liveness shows up —
+  // track them so we can answer the app's ROUTERS? and forward router presence
+  // to the cloud. Sensors (S) are already tracked via their readings; skip them.
+  if (line.startsWith("MESH_NODE ")) {
+    int sp1 = line.indexOf(' ');
+    int sp2 = line.indexOf(' ', sp1 + 1);
+    if (sp1 > 0 && sp2 > sp1) {
+      String eui  = line.substring(sp1 + 1, sp2);
+      String type = line.substring(sp2 + 1);
+      type.trim();
+      if (type == "R") noteSeenRouter(eui);
+    }
+    return;
+  }
   // Fleet factory-reset relayed from the mesh by our C6 -> wipe + reboot.
   if (line.startsWith("RESET_NOW")) {
     doFactoryReset();   // does not return
@@ -1058,6 +1136,21 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         }
       }
       bleNotifyLine("NODES_END");
+      return;
+    }
+
+    // A1b. ROUTERS? — reply with the routers the C6 leader currently sees in the
+    //      mesh (from its MESH_NODE roster), so the app can show them + online
+    //      status. Chunked like NODES?.
+    if (sCmd == "ROUTERS?") {
+      bleNotifyLine("ROUTERS_BEGIN");
+      uint32_t now = millis();
+      for (int i = 0; i < SEEN_MAX; i++) {
+        if (!g_routers[i].eui.isEmpty() && (now - g_routers[i].lastMs) < ROUTER_WINDOW_MS) {
+          bleNotifyLine("ROUTER|" + g_routers[i].eui);
+        }
+      }
+      bleNotifyLine("ROUTERS_END");
       return;
     }
 
@@ -1386,6 +1479,7 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) { g_lastDiscover = now; discoverNode(); }
       if (now - g_lastBeat     >= BEAT_INTERVAL_MS)     { g_lastBeat = now;     heartbeatPresence(); }
+      if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
     } else if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) {
       g_lastDiscover = now;
       Serial.printf("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
