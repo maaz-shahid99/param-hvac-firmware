@@ -13,7 +13,6 @@
 #include "freertos/task.h"
 #include "esp_random.h"
 #include "esp_mac.h"
-#include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +70,8 @@ static uint32_t s_last_reset_nonce = 0;
 typedef struct { char eui[17]; char role; uint32_t last_ms; } roster_entry_t;
 static roster_entry_t s_roster[ROSTER_MAX];
 
-static uint32_t ms_now(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+// Milliseconds since boot from the FreeRTOS tick (avoids an esp_timer dep).
+static uint32_t ms_now(void) { return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS); }
 
 // Our own factory EUI-64 as 16 lowercase hex chars (matches the sensors' EUI).
 static void own_eui64(char out[17])
