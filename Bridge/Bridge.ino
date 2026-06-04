@@ -139,14 +139,16 @@ static const uint32_t SEEN_WINDOW_MS  = 300000;   // 5 min "live" window
 static SeenNode       g_seen[SEEN_MAX];
 static void noteSeenEui(const String &eui);
 
-// --- Live "seen" router table -------------------------------------------------
-// Populated from the C6 leader's "MESH_NODE <eui> R" roster lines. Routers don't
-// send sensor readings, so this is how we know which routers are in the mesh and
-// whether they're alive. Answers the app's "ROUTERS?" and is forwarded to the
-// cloud (/v1/mesh) so the web dashboard can show routers too.
-static const uint32_t ROUTER_WINDOW_MS = 60000;   // 1 min "online" window (roster re-sent ~10s)
-static SeenNode       g_routers[SEEN_MAX];
-static void noteSeenRouter(const String &eui);
+// --- Live mesh-node table (C6 gateways + routers) -----------------------------
+// Populated from the C6 leader's "MESH_NODE <eui> <G|R>" roster lines (the leader
+// aggregates self-announced identities mesh-wide). EUIs are real factory EUI-64s
+// (match commissioning). role: 'G' = active gateway/leader, 'R' = (standby)
+// router. Answers the app's "ROUTERS?" and is forwarded to the cloud (/v1/mesh)
+// so the web dashboard shows them too. Survives gateway failover (G moves).
+static const uint32_t MESH_WINDOW_MS = 60000;   // 1 min "online" window (roster re-sent ~10s)
+struct MeshNode { String eui; char role; uint32_t lastMs; };
+static MeshNode       g_mesh[SEEN_MAX];
+static void noteMeshNode(const String &eui, char role);
 
 // OTA is requested from the BLE task but RUN from loop() so that Serial1 has a
 // single reader during the C6 transfer. 0=none, 1=check/self-update C3, 2=push C6.
@@ -507,18 +509,19 @@ static void noteSeenEui(const String &eui) {
   g_seen[oldest].lastMs = now;
 }
 
-// --- Record that the C6 just reported a router in the mesh (for ROUTERS?) ---
-static void noteSeenRouter(const String &eui) {
+// --- Record a mesh node (C6 gateway/router) the C6 leader reported (ROUTERS?) ---
+static void noteMeshNode(const String &eui, char role) {
   if (eui.isEmpty()) return;
   uint32_t now = millis();
   int oldest = 0;
   for (int i = 0; i < SEEN_MAX; i++) {
-    if (g_routers[i].eui == eui) { g_routers[i].lastMs = now; return; }   // refresh
-    if (g_routers[i].eui.isEmpty()) { g_routers[i].eui = eui; g_routers[i].lastMs = now; return; }
-    if (g_routers[i].lastMs < g_routers[oldest].lastMs) oldest = i;       // track LRU
+    if (g_mesh[i].eui == eui) { g_mesh[i].role = role; g_mesh[i].lastMs = now; return; }   // refresh
+    if (g_mesh[i].eui.isEmpty()) { g_mesh[i].eui = eui; g_mesh[i].role = role; g_mesh[i].lastMs = now; return; }
+    if (g_mesh[i].lastMs < g_mesh[oldest].lastMs) oldest = i;             // track LRU
   }
-  g_routers[oldest].eui = eui;
-  g_routers[oldest].lastMs = now;
+  g_mesh[oldest].eui = eui;
+  g_mesh[oldest].role = role;
+  g_mesh[oldest].lastMs = now;
 }
 
 // --- Forward the live router roster to the cloud (/v1/mesh), if configured ---
@@ -531,12 +534,12 @@ static void forwardMeshCloud() {
   uint32_t now = millis();
   String arr; int n = 0;
   for (int i = 0; i < SEEN_MAX; i++) {
-    if (!g_routers[i].eui.isEmpty() && (now - g_routers[i].lastMs) < ROUTER_WINDOW_MS) {
+    if (!g_mesh[i].eui.isEmpty() && (now - g_mesh[i].lastMs) < MESH_WINDOW_MS) {
       if (n++) arr += ",";
-      arr += String("{\"eui\":\"") + g_routers[i].eui + "\"}";
+      arr += String("{\"eui\":\"") + g_mesh[i].eui + "\",\"role\":\"" + String(g_mesh[i].role) + "\"}";
     }
   }
-  if (n == 0) return;   // nothing to report; cloud ages routers out by freshness
+  if (n == 0) return;   // nothing to report; cloud ages nodes out by freshness
 
   HTTPClient http;
   http.setConnectTimeout(3000);
@@ -554,9 +557,9 @@ static void forwardMeshCloud() {
   if (!began) return;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-API-Key", g_cloudKey);
-  int code = http.POST(String("{\"routers\":[") + arr + "]}");
+  int code = http.POST(String("{\"nodes\":[") + arr + "]}");
   http.end();
-  Serial.printf("[CLOUD] mesh roster (%d routers) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+  Serial.printf("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
 }
 
 // --- Register an EUI -> box/slot mapping on the display node (commissioning) ---
@@ -854,10 +857,10 @@ static void handleCommissionerLine(const String &line) {
     g_c6Version = line.substring(11).toInt();
     return;
   }
-  // Mesh roster line from the C6 leader: "MESH_NODE <eui> <R|S>". Routers never
-  // send sensor readings, so this is the only place their liveness shows up —
-  // track them so we can answer the app's ROUTERS? and forward router presence
-  // to the cloud. Sensors (S) are already tracked via their readings; skip them.
+  // Mesh roster line from the C6 leader: "MESH_NODE <eui> <G|R>" (G = active
+  // gateway/leader, R = router). Track every C6 node so we can answer the app's
+  // ROUTERS? and forward the roster to the cloud. (Sensors are not C6 nodes —
+  // they're tracked via their readings / NODES?.)
   if (line.startsWith("MESH_NODE ")) {
     int sp1 = line.indexOf(' ');
     int sp2 = line.indexOf(' ', sp1 + 1);
@@ -865,7 +868,7 @@ static void handleCommissionerLine(const String &line) {
       String eui  = line.substring(sp1 + 1, sp2);
       String type = line.substring(sp2 + 1);
       type.trim();
-      if (type == "R") noteSeenRouter(eui);
+      noteMeshNode(eui, (type == "G") ? 'G' : 'R');
     }
     return;
   }
@@ -1139,15 +1142,15 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
 
-    // A1b. ROUTERS? — reply with the routers the C6 leader currently sees in the
-    //      mesh (from its MESH_NODE roster), so the app can show them + online
-    //      status. Chunked like NODES?.
+    // A1b. ROUTERS? — reply with the C6 mesh nodes the leader currently sees
+    //      (gateway + routers), each with its role, so the app can show them +
+    //      online status. Chunked like NODES?. Line: "ROUTER|<eui>|<G|R>".
     if (sCmd == "ROUTERS?") {
       bleNotifyLine("ROUTERS_BEGIN");
       uint32_t now = millis();
       for (int i = 0; i < SEEN_MAX; i++) {
-        if (!g_routers[i].eui.isEmpty() && (now - g_routers[i].lastMs) < ROUTER_WINDOW_MS) {
-          bleNotifyLine("ROUTER|" + g_routers[i].eui);
+        if (!g_mesh[i].eui.isEmpty() && (now - g_mesh[i].lastMs) < MESH_WINDOW_MS) {
+          bleNotifyLine(String("ROUTER|") + g_mesh[i].eui + "|" + String(g_mesh[i].role));
         }
       }
       bleNotifyLine("ROUTERS_END");

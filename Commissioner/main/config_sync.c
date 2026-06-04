@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_random.h"
+#include "esp_mac.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +60,46 @@ static bool        s_sock_open = false;
 // Last fleet-OTA / fleet-reset nonce we acted on (dedup: relay each once).
 static uint32_t s_last_ota_nonce = 0;
 static uint32_t s_last_reset_nonce = 0;
+
+// ---- Mesh node roster --------------------------------------------------
+// Every C6 multicasts "IDENT|<eui>|<G|R>"; the leader aggregates them here and
+// reports the roster to its C3. EUI is the factory IEEE EUI-64 (same source the
+// sensors use -> matches commissioning). This survives gateway failover: the
+// role 'G' simply moves to whichever node is currently the leader.
+#define ROSTER_MAX        16
+#define ROSTER_WINDOW_MS  60000u      // a node is "live" if heard within this
+typedef struct { char eui[17]; char role; uint32_t last_ms; } roster_entry_t;
+static roster_entry_t s_roster[ROSTER_MAX];
+
+static uint32_t ms_now(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+// Our own factory EUI-64 as 16 lowercase hex chars (matches the sensors' EUI).
+static void own_eui64(char out[17])
+{
+    uint8_t mac[8] = {0};
+    if (esp_read_mac(mac, ESP_MAC_IEEE802154) == ESP_OK) {
+        for (int i = 0; i < 8; i++) sprintf(out + i * 2, "%02x", mac[i]);
+        out[16] = '\0';
+    } else {
+        strcpy(out, "0000000000000000");
+    }
+}
+
+static void roster_note(const char *eui, char role)
+{
+    uint32_t now = ms_now();
+    int oldest = 0;
+    for (int i = 0; i < ROSTER_MAX; i++) {
+        if (strcmp(s_roster[i].eui, eui) == 0) { s_roster[i].role = role; s_roster[i].last_ms = now; return; }
+        if (s_roster[i].eui[0] == '\0') {
+            strncpy(s_roster[i].eui, eui, 16); s_roster[i].eui[16] = '\0';
+            s_roster[i].role = role; s_roster[i].last_ms = now; return;
+        }
+        if (s_roster[i].last_ms < s_roster[oldest].last_ms) oldest = i;
+    }
+    strncpy(s_roster[oldest].eui, eui, 16); s_roster[oldest].eui[16] = '\0';
+    s_roster[oldest].role = role; s_roster[oldest].last_ms = now;
+}
 
 // ---- HMAC-SHA256 over a string -> 64-char lowercase hex ----------------
 static void compute_hmac_hex(const char *msg, char out_hex[65])
@@ -245,6 +287,21 @@ static void cfg_recv_cb(void *ctx, otMessage *msg, const otMessageInfo *info)
     otMessageRead(msg, otMessageGetOffset(msg), buf, len);
     buf[len] = '\0';
 
+    // Mesh identity announce from a C6 node: "IDENT|<eui16hex>|<G|R>". Every C6
+    // multicasts this; the leader aggregates them into the roster it reports to
+    // its C3 (so we have REAL factory EUIs + live roles, even across failover).
+    if (strncmp(buf, "IDENT|", 6) == 0) {
+        char *p = buf + 6;
+        char *bar = strchr(p, '|');
+        if (bar && (bar - p) == 16) {
+            char eui[17];
+            memcpy(eui, p, 16);
+            eui[16] = '\0';
+            roster_note(eui, bar[1] == 'G' ? 'G' : 'R');
+        }
+        return;
+    }
+
     // A peer is asking for the latest config: answer if we hold one.
     if (strncmp(buf, "CFGREQ", 6) == 0) {
         if (s_cfg.version > 0) {
@@ -339,30 +396,41 @@ static void signal_gateway_role_locked(void)
     fflush(stdout);
 }
 
-// ---- Report the mesh neighbour roster to the C3 (leader/gateway only) ----
-// Emits one "MESH_NODE <eui64> <R|S>" line per Thread neighbour so the C3 can
-// answer the app's ROUTERS? query and forward router presence to the cloud.
-// Routers (full Thread devices) never send sensor readings, so this neighbour
-// table is the only place their liveness is visible. The EUI is printed as the
-// IEEE EUI-64 — the Thread extended address with the U/L bit of byte 0 flipped
-// back — so it matches the EUI used at commissioning / in sensor readings.
-// (The leader sees its directly-attached neighbours; in the small star meshes
-// we deploy, the gateway is adjacent to every router.)
-static void signal_mesh_roster_locked(void)
+// ---- Announce our own identity to the mesh (every C6 node) -------------
+// Multicasts "IDENT|<eui>|<G|R>" so the current leader can build a roster of
+// every C6 (gateway + routers) keyed by real factory EUI. G = we are the active
+// leader/gateway, R = we are a (standby) router.
+static void announce_identity_locked(void)
+{
+    otInstance *inst = esp_openthread_get_instance();
+    char eui[17];
+    own_eui64(eui);
+    char role = (otThreadGetDeviceRole(inst) == OT_DEVICE_ROLE_LEADER) ? 'G' : 'R';
+    char payload[40];
+    snprintf(payload, sizeof(payload), "IDENT|%s|%c", eui, role);
+    send_multicast_locked(payload);
+}
+
+// ---- Leader: report the mesh-node roster to the local C3 ---------------
+// Emits "MESH_NODE <eui> <G|R>" for every live C6 node (ourself + peers heard
+// via IDENT). Uses the REAL factory EUI-64 (matches commissioning + sensor
+// readings). Sensors are not C6 nodes — they're tracked separately via NODES?.
+// On failover this just works: whoever is leader prints itself as G.
+static void report_roster_locked(void)
 {
     otInstance *inst = esp_openthread_get_instance();
     if (otThreadGetDeviceRole(inst) != OT_DEVICE_ROLE_LEADER) return;  // only the gateway reports
 
-    otNeighborInfoIterator it = OT_NEIGHBOR_INFO_ITERATOR_INIT;
-    otNeighborInfo info;
-    while (otThreadGetNextNeighborInfo(inst, &it, &info) == OT_ERROR_NONE) {
-        uint8_t e[8];
-        memcpy(e, info.mExtAddress.m8, sizeof(e));
-        e[0] ^= 0x02;   // Thread ext-addr -> IEEE EUI-64
-        // Full Thread device = router-capable; sleepy/MTD = sensor.
-        const char *type = info.mFullThreadDevice ? "R" : "S";
-        printf("MESH_NODE %02x%02x%02x%02x%02x%02x%02x%02x %s\n",
-               e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], type);
+    char self_eui[17];
+    own_eui64(self_eui);
+    printf("MESH_NODE %s G\n", self_eui);          // the active gateway = us
+
+    uint32_t now = ms_now();
+    for (int i = 0; i < ROSTER_MAX; i++) {
+        if (s_roster[i].eui[0] == '\0') continue;
+        if (strcmp(s_roster[i].eui, self_eui) == 0) continue;        // don't double-report self
+        if ((now - s_roster[i].last_ms) > ROSTER_WINDOW_MS) continue; // aged out
+        printf("MESH_NODE %s %c\n", s_roster[i].eui, s_roster[i].role);
     }
     fflush(stdout);
 }
@@ -394,11 +462,13 @@ static void config_sync_task(void *arg)
 #endif
         }
 
-        // 2) Periodically re-signal our gateway role + mesh roster to the C3.
+        // 2) Periodically re-signal our gateway role, announce our identity to
+        //    the mesh, and (if leader) report the aggregated node roster.
         if ((tick % CFG_ROLE_EVERY) == 0) {
             if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
                 signal_gateway_role_locked();
-                signal_mesh_roster_locked();
+                announce_identity_locked();   // every node announces itself
+                report_roster_locked();       // leader reports the whole roster
                 esp_openthread_lock_release();
             }
         }
