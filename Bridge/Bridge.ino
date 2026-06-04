@@ -26,7 +26,7 @@ static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 11
+#define BRIDGE_FW_VERSION 12
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
 #include "logger.h"
@@ -1141,18 +1141,19 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     // A1. NODES? — reply with the live sensor EUIs we've recently seen so the
     //     app can offer a device dropdown. Chunked to survive the BLE MTU.
     if (sCmd == "NODES?") {
-      bleNotifyLine("NODES_BEGIN");
-      delay(8);                                   // space chunks so BEGIN isn't dropped
+      // ONE notification (one line) so nothing is dropped by back-to-back BLE
+      // notifies: "NODES|<eui>,<eui>,..." (empty list -> "NODES|"). Fits the
+      // 256-byte MTU for ~14 sensors.
+      String resp = "NODES|";
       uint32_t now = millis();
       int count = 0;
       for (int i = 0; i < SEEN_MAX; i++) {
         if (!g_seen[i].eui.isEmpty() && (now - g_seen[i].lastMs) < SEEN_WINDOW_MS) {
-          bleNotifyLine("NODE|" + g_seen[i].eui);
-          delay(8);
-          count++;
+          if (count++) resp += ",";
+          resp += g_seen[i].eui;
         }
       }
-      bleNotifyLine("NODES_END");
+      bleNotifyLine(resp);
       Serial.printf("[NODES?] replied %d live\n", count);   // diag
       return;
     }
@@ -1161,16 +1162,16 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     //      (gateway + routers), each with its role, so the app can show them +
     //      online status. Chunked like NODES?. Line: "ROUTER|<eui>|<G|R>".
     if (sCmd == "ROUTERS?") {
-      bleNotifyLine("ROUTERS_BEGIN");
-      delay(8);
+      // ONE notification: "ROUTERS|<eui>:<role>,..." (role G/R). Empty -> "ROUTERS|".
+      String resp = "ROUTERS|";
       uint32_t now = millis();
       for (int i = 0; i < SEEN_MAX; i++) {
         if (!g_mesh[i].eui.isEmpty() && (now - g_mesh[i].lastMs) < MESH_WINDOW_MS) {
-          bleNotifyLine(String("ROUTER|") + g_mesh[i].eui + "|" + String(g_mesh[i].role));
-          delay(8);
+          if (resp.length() > 8) resp += ",";
+          resp += g_mesh[i].eui + ":" + String(g_mesh[i].role);
         }
       }
-      bleNotifyLine("ROUTERS_END");
+      bleNotifyLine(resp);
       return;
     }
 
@@ -1356,7 +1357,7 @@ void setup() {
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
 
   Serial.println("\n[BOOT] Bridge Starting...");
-  Serial.printf("[BOOT] C3 fw v%d — NODES? local; SEEN diag on\n", BRIDGE_FW_VERSION);
+  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?\n", BRIDGE_FW_VERSION);
 
   // Initialize Authentication Defaults if first boot
   preferences.begin(AUTH_NAMESPACE, false);
