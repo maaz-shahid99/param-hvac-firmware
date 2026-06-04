@@ -1,11 +1,18 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>   // TLS for HTTPS cloud endpoints
 #include <Update.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <nvs_flash.h>  // Added for full NVS wipe
 #include "mbedtls/base64.h"
+
+// Root CA (PEM) used to validate the cloud server's TLS certificate. Leave
+// empty to use setInsecure() — traffic is still encrypted, but the cert is not
+// verified (fine for bring-up; PASTE YOUR CA HERE before shipping to customers
+// so the gateway can't be MITM'd). Only used when the cloud URL is https://.
+static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
@@ -435,9 +442,24 @@ static void forwardReading(const String &eui, const String &data) {
 static void forwardReadingCloud(const String &eui, const String &data) {
   if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
   HTTPClient http;
-  http.setConnectTimeout(2000);
-  http.setTimeout(2000);
-  if (!http.begin(g_cloudUrl + "/v1/readings")) return;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
+  // Use a TLS client for https:// (production), a plain client for http://
+  // (local bring-up). The secure client must outlive the request, so both are
+  // declared here on the stack.
+  WiFiClientSecure secure;
+  WiFiClient       plain;
+  bool began;
+  if (g_cloudUrl.startsWith("https://")) {
+    if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA);  // verify cert
+    else                           secure.setInsecure();             // encrypt only
+    began = http.begin(secure, g_cloudUrl + "/v1/readings");
+  } else {
+    began = http.begin(plain, g_cloudUrl + "/v1/readings");
+  }
+  if (!began) return;
+
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-API-Key", g_cloudKey);
   String body = String("{\"sensor_id\":\"") + eui + "\",\"data\":\"" + data + "\"}";
