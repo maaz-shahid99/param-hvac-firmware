@@ -26,7 +26,7 @@ static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 13
+#define BRIDGE_FW_VERSION 14
 
 // Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
 // commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
@@ -159,6 +159,17 @@ static const int      SEEN_MAX        = 64;
 static const uint32_t SEEN_WINDOW_MS  = 30000;    // 30s "live" window (~3 missed 10s reports) — fast offline detect
 static SeenNode       g_seen[SEEN_MAX];
 static void noteSeenEui(const String &eui);
+
+// --- Per-sensor probe cache ---------------------------------------------------
+// Latest probe CSV (after "t=") heard from each sensor, so the app can ask
+// "PROBES?<eui>" and get the probe ROMs + temps to build a per-probe assign
+// dropdown — without waiting on the (possibly offline) cloud. ROM-tagged for new
+// SED firmware ("<rom>:<temp>,..."); a legacy bare-temp CSV is synthesized into
+// position roms (idx0,idx1,...) when answered.
+struct ProbeCache { String eui; String csv; uint32_t lastMs; };
+static const int      PROBE_MAX = 16;
+static ProbeCache     g_probes[PROBE_MAX];
+static void noteProbes(const String &eui, const String &data);
 
 // --- Live mesh-node table (C6 gateways + routers) -----------------------------
 // Populated from the C6 leader's "MESH_NODE <eui> <G|R>" roster lines (the leader
@@ -530,6 +541,46 @@ static void noteSeenEui(const String &eui) {
   }
   g_seen[oldest].eui = eui;                                          // table full -> evict LRU
   g_seen[oldest].lastMs = now;
+}
+
+// --- Cache a sensor's latest probe CSV (for the PROBES? dropdown) ---
+// [data] is the payload after "EUI=<hex>;" i.e. "t=<rom>:<temp>,..." (or legacy
+// "t=<v>,..."); we store the part after "t=".
+static void noteProbes(const String &eui, const String &data) {
+  if (eui.isEmpty()) return;
+  String csv = data;
+  int eq = csv.indexOf('=');
+  if (eq >= 0) csv = csv.substring(eq + 1);   // drop the "t=" tag
+  csv.trim();
+  uint32_t now = millis();
+  int oldest = 0;
+  for (int i = 0; i < PROBE_MAX; i++) {
+    if (g_probes[i].eui == eui) { g_probes[i].csv = csv; g_probes[i].lastMs = now; return; }
+    if (g_probes[i].eui.isEmpty()) { g_probes[i].eui = eui; g_probes[i].csv = csv; g_probes[i].lastMs = now; return; }
+    if (g_probes[i].lastMs < g_probes[oldest].lastMs) oldest = i;
+  }
+  g_probes[oldest].eui = eui; g_probes[oldest].csv = csv; g_probes[oldest].lastMs = now;
+}
+
+// Normalize a cached probe CSV to "<rom>:<temp>,..." for the PROBES? reply. A
+// ROM-tagged CSV passes through; a legacy bare-temp CSV gets position roms.
+static String probesToRomTemp(const String &csv) {
+  if (csv.length() == 0) return "";
+  if (csv.indexOf(':') >= 0) return csv;        // already <rom>:<temp>
+  String out = "";
+  int start = 0, idx = 0;
+  while (start <= (int)csv.length()) {
+    int comma = csv.indexOf(',', start);
+    String tok = (comma < 0) ? csv.substring(start) : csv.substring(start, comma);
+    tok.trim();
+    if (tok.length() > 0) {
+      if (out.length() > 0) out += ",";
+      out += "idx" + String(idx++) + ":" + tok;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return out;
 }
 
 // --- Record a mesh node (C6 gateway/router) the C6 leader reported (ROUTERS?) ---
@@ -951,6 +1002,7 @@ static void handleCommissionerLine(const String &line) {
           // to the commissioner, which isn't always the active leader) so NODES?
           // is never empty. Only the ACTIVE gateway forwards (avoids duplicates).
           noteSeenEui(eui);
+          noteProbes(eui, data);                        // cache probe ROMs for PROBES?
           if (BRIDGE_VERBOSE) Serial.printf("[SEEN+] %s\n", eui.c_str());   // diag (verbose only)
           if (isActiveGateway) forwardReading(eui, data);
         }
@@ -1174,7 +1226,8 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     // only device lists / status (sensor + mesh EUIs, roles, versions, link
     // state) — no secrets, no control — so the app can populate its Devices view
     // and the assign dropdown the moment it connects, even before unlocking.
-    bool isReadOnlyQuery = (sCmd == "NODES?" || sCmd == "ROUTERS?" || sCmd == "SYS?");
+    bool isReadOnlyQuery = (sCmd == "NODES?" || sCmd == "ROUTERS?" || sCmd == "SYS?" ||
+                          sCmd.startsWith("PROBES?"));
 
     // ==========================================
     // 3. THE GATEKEEPER
@@ -1232,6 +1285,26 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         }
       }
       bleNotifyLine(resp);
+      return;
+    }
+
+    // A1c. PROBES?<eui> — reply with one sensor's last-heard probe ROMs + temps
+    //      so the app can offer a per-probe assign dropdown. One notification:
+    //      "PROBES|<eui>|<rom>:<temp>,..." (empty list -> trailing "|").
+    if (sCmd.startsWith("PROBES?")) {
+      String eui = sCmd.substring(7);
+      eui.trim();
+      eui.toLowerCase();
+      String resp = "PROBES|" + eui + "|";
+      uint32_t now = millis();
+      for (int i = 0; i < PROBE_MAX; i++) {
+        if (g_probes[i].eui == eui && (now - g_probes[i].lastMs) < SEEN_WINDOW_MS) {
+          resp += probesToRomTemp(g_probes[i].csv);
+          break;
+        }
+      }
+      bleNotifyLine(resp);
+      Serial.printf("[PROBES?] %s\n", eui.c_str());
       return;
     }
 
@@ -1417,7 +1490,7 @@ void setup() {
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
 
   Serial.println("\n[BOOT] Bridge Starting...");
-  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?; 30s live window\n", BRIDGE_FW_VERSION);
+  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?/PROBES?; 30s live window\n", BRIDGE_FW_VERSION);
 
   // Initialize Authentication Defaults if first boot
   preferences.begin(AUTH_NAMESPACE, false);

@@ -18,8 +18,9 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define ONE_WIRE_BUS D4     // Data wire is plugged into D1
-#define NUM_SENSORS 8      // Number of DS18B20 sensors
+#define ONE_WIRE_BUS D4     // Data wire is plugged into D4
+#define NUM_SENSORS 8      // (legacy) nominal DS18B20 count
+#define MAX_PROBES  10     // hard cap on probes reported per reading
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
@@ -212,25 +213,32 @@ void loop() {
     // 3a. Read Sensors (This blocks for ~750ms, so we do it BEFORE locking Thread)
     ds18b20.requestTemperatures();
     
-    // Payload tags the sensor's EUI then a CSV of probe temps:
-    //   "EUI=58e6c5fffe164ec0;t=23.1,24.2,err,..."
-    char payload[160];
+    // Payload tags the sensor's EUI then a CSV of ROM-tagged probe temps:
+    //   "EUI=58e6c5fffe164ec0;t=28ff..a1:23.1,28ff..b2:err,..."
+    // Each probe is identified by its DS18B20 ROM (64-bit serial) so an exhaust
+    // mapping survives unplug/reorder. Count is auto-detected (capped MAX_PROBES).
+    char payload[360];
     snprintf(payload, sizeof(payload), "EUI=%s;t=", g_eui);
-    char tempStr[10];
+    char tempStr[32];
+    char romStr[17];
 
-    for (int i = 0; i < NUM_SENSORS; i++) {
-      float temp = ds18b20.getTempCByIndex(i);
-      
-      // Add a comma between values
-      if (i > 0) strcat(payload, ",");
-      
-      // Catch disconnected sensors
+    int n = ds18b20.getDeviceCount();
+    if (n > MAX_PROBES) n = MAX_PROBES;
+    int emitted = 0;
+    DeviceAddress addr;
+    for (int i = 0; i < n; i++) {
+      if (!ds18b20.getAddress(addr, i)) continue;   // probe vanished mid-scan
+      for (int b = 0; b < 8; b++) snprintf(romStr + b * 2, 3, "%02x", addr[b]);
+      float temp = ds18b20.getTempC(addr);
+
+      if (emitted > 0) strcat(payload, ",");
       if (temp == DEVICE_DISCONNECTED_C) {
-        strcat(payload, "err"); 
+        snprintf(tempStr, sizeof(tempStr), "%s:err", romStr);
       } else {
-        snprintf(tempStr, sizeof(tempStr), "%.1f", temp);
-        strcat(payload, tempStr);
+        snprintf(tempStr, sizeof(tempStr), "%s:%.1f", romStr, temp);
       }
+      strcat(payload, tempStr);
+      emitted++;
     }
 
     // 3b. Acquire OpenThread Lock and Transmit
