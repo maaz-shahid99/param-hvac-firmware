@@ -26,7 +26,15 @@ static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 12
+#define BRIDGE_FW_VERSION 13
+
+// Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
+// commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
+// notable C6 lines (warnings/errors/joiner/network). 1 = firehose: echo every
+// raw C6 UART line + per-reading [SEEN+]/[FWD ok] + verbose status. Flip to 1
+// for deep bring-up debugging.
+#define BRIDGE_VERBOSE 0
+
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
 #include "logger.h"
@@ -76,6 +84,17 @@ Preferences preferences;
 volatile bool bleClientConnected = false;
 volatile bool bleClientSecured = false;        // OS-Level Encryption (Just Works)
 volatile bool isSessionAuthenticated = false;  // App-Level Authentication
+
+// BLE connect/disconnect flap de-spam: a misbehaving central (e.g. a stale bond
+// after a reflash) can connect+drop ~1/s. We print the first cycle (with the
+// disconnect reason) then collapse the repeats into one summary every 5s.
+static String   g_bleLastCentral;
+static uint32_t g_bleFlapCount  = 0;
+static uint32_t g_bleLastConnMs = 0;
+static uint32_t g_bleSummaryMs  = 0;
+static int      g_bleLastReason = 0;
+static const uint32_t BLE_FLAP_GAP_MS    = 2500;   // reconnect faster than this from same addr = flapping
+static const uint32_t BLE_FLAP_SUMMARY_MS = 5000;  // at most one flap summary this often
 bool isCommissionerMode = false;
 // State tracked via Switch
 
@@ -123,7 +142,9 @@ static String   g_cloudKey     = "";                        // X-API-Key -> tena
 static uint32_t g_lastDiscover = 0;
 static uint32_t g_lastBeat     = 0;
 static uint32_t g_lastMesh     = 0;
+static uint32_t g_lastWifiWarn = 0;                         // rate-limit the "Wi-Fi NOT connected" line
 static const uint32_t DISCOVER_INTERVAL_MS = 10000;
+static const uint32_t WIFI_WARN_INTERVAL_MS = 60000;       // warn at most once/min while Wi-Fi is down
 static const uint32_t BEAT_INTERVAL_MS     = 10000;
 static const uint32_t MESH_PUSH_INTERVAL_MS = 30000;   // push router roster to cloud every 30s
 
@@ -135,7 +156,7 @@ static const uint32_t MESH_PUSH_INTERVAL_MS = 30000;   // push router roster to 
 // attached to.
 struct SeenNode { String eui; uint32_t lastMs; };
 static const int      SEEN_MAX        = 64;
-static const uint32_t SEEN_WINDOW_MS  = 300000;   // 5 min "live" window
+static const uint32_t SEEN_WINDOW_MS  = 30000;    // 30s "live" window (~3 missed 10s reports) — fast offline detect
 static SeenNode       g_seen[SEEN_MAX];
 static void noteSeenEui(const String &eui);
 
@@ -451,10 +472,11 @@ static void forwardReading(const String &eui, const String &data) {
   int code = http.POST(body);
   http.end();
   if (code > 0) {
-    Serial.printf("[FWD] %s -> %s/ingest (%d)\n", eui.c_str(), g_nodeUrl.c_str(), code);
+    if (BRIDGE_VERBOSE)
+      Serial.printf("[FWD] %s -> %s/ingest (%d)\n", eui.c_str(), g_nodeUrl.c_str(), code);
   } else {
     Serial.printf("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
-    g_nodeUrl = "";   // node unreachable -> force a re-discover
+    g_nodeUrl = "";   // node unreachable -> force a re-discover (kept: it's an error)
   }
   forwardReadingCloud(eui, data);
 }
@@ -489,7 +511,8 @@ static void forwardReadingCloud(const String &eui, const String &data) {
   int code = http.POST(body);
   http.end();
   if (code > 0) {
-    Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
+    if (BRIDGE_VERBOSE)
+      Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
   } else {
     Serial.printf("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
   }
@@ -653,6 +676,19 @@ static void performOtaCheck() {
 // ===== Phase 2: stream a C6 firmware image to the C6 over UART =====
 
 static void flushSerial1() { while (Serial1.available()) Serial1.read(); }
+
+// In quiet mode, only echo C6 UART lines that carry a real signal — warnings,
+// errors, joiner/network/config events — not the routine sensor-data dumps and
+// role/version/mesh heartbeats. (The OpenThread "[W] ... Security" warning is
+// kept via "[W]" + "Fail".)
+static bool isNotableC6Line(const String &s) {
+  return s.indexOf("ERR")  >= 0 || s.indexOf("Error") >= 0 ||
+         s.indexOf("Fail") >= 0 || s.indexOf("Reject") >= 0 ||
+         s.indexOf("[W]")  >= 0 || s.indexOf("[E]")  >= 0 ||
+         s.indexOf("JOIN") >= 0 || s.indexOf("NETWORK_FORMED") >= 0 ||
+         s.indexOf("CFG_PUBLISHED") >= 0 || s.indexOf("PANIC") >= 0 ||
+         s.indexOf("assert") >= 0;
+}
 
 // Wait for a UART line from the C6 that starts with `expected`. Ignores other
 // lines (logs, [UDP_RX], GW_ROLE, …). Returns false on timeout or OTA_ERR.
@@ -915,7 +951,7 @@ static void handleCommissionerLine(const String &line) {
           // to the commissioner, which isn't always the active leader) so NODES?
           // is never empty. Only the ACTIVE gateway forwards (avoids duplicates).
           noteSeenEui(eui);
-          Serial.printf("[SEEN+] %s\n", eui.c_str());   // diag: proves the seen-list path runs
+          if (BRIDGE_VERBOSE) Serial.printf("[SEEN+] %s\n", eui.c_str());   // diag (verbose only)
           if (isActiveGateway) forwardReading(eui, data);
         }
       }
@@ -976,18 +1012,42 @@ class BridgeServerCallbacks : public NimBLEServerCallbacks {
     bleClientConnected = true;
     bleClientSecured = connInfo.isEncrypted();
     isSessionAuthenticated = false;  // Reset app-level auth on new connection
-    Serial.printf("[BLE] Connected: %s\n", connInfo.getAddress().toString().c_str());
+
+    String addr = connInfo.getAddress().toString().c_str();
+    uint32_t now = millis();
+    bool flapping = (addr == g_bleLastCentral) && (now - g_bleLastConnMs < BLE_FLAP_GAP_MS);
+    if (flapping) {
+      g_bleFlapCount++;
+      if (now - g_bleSummaryMs >= BLE_FLAP_SUMMARY_MS) {   // collapse the storm
+        g_bleSummaryMs = now;
+        Serial.printf("[BLE] %s flapping — %lu connect/drop cycles (last reason=%d); check pairing/bond\n",
+                      addr.c_str(), (unsigned long)g_bleFlapCount, g_bleLastReason);
+      }
+    } else {
+      g_bleFlapCount = 0;
+      g_bleSummaryMs = now;
+      Serial.printf("[BLE] Connected: %s\n", addr.c_str());
+    }
+    g_bleLastCentral = addr;
+    g_bleLastConnMs = now;
   }
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
     bleClientConnected = false;
     bleClientSecured = false;
     isSessionAuthenticated = false;  // Clear session state
-    Serial.println("[BLE] Disconnected.");
+    g_bleLastReason = reason;
+
+    // Quiet during a flap storm (the periodic summary above covers it); otherwise
+    // log the disconnect WITH its reason code (e.g. 13=remote term, 8=supervision
+    // timeout, 61/0x3d=encryption/MIC failure => stale bond).
+    if (g_bleFlapCount == 0) {
+      Serial.printf("[BLE] Disconnected (reason=%d)\n", reason);
+    }
 
     if (bleShouldAdvertise()) {
       NimBLEDevice::startAdvertising();
-      Serial.println("[BLE] Restarted Advertising.");
+      if (g_bleFlapCount == 0) Serial.println("[BLE] Restarted Advertising.");
     }
   }
 
@@ -1357,7 +1417,7 @@ void setup() {
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
 
   Serial.println("\n[BOOT] Bridge Starting...");
-  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?\n", BRIDGE_FW_VERSION);
+  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?; 30s live window\n", BRIDGE_FW_VERSION);
 
   // Initialize Authentication Defaults if first boot
   preferences.begin(AUTH_NAMESPACE, false);
@@ -1468,7 +1528,11 @@ void loop() {
       lineBuf[lineLen] = '\0';
       String line(lineBuf);
 
-      Serial.printf("[UART Rx] %s\n", lineBuf);
+      if (BRIDGE_VERBOSE) {
+        Serial.printf("[UART Rx] %s\n", lineBuf);     // firehose
+      } else if (isNotableC6Line(line)) {
+        Serial.printf("[C6] %s\n", lineBuf);          // quiet: signal only
+      }
       handleCommissionerLine(line);
 
       lineLen = 0;
@@ -1502,8 +1566,8 @@ void loop() {
       if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) { g_lastDiscover = now; discoverNode(); }
       if (now - g_lastBeat     >= BEAT_INTERVAL_MS)     { g_lastBeat = now;     heartbeatPresence(); }
       if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
-    } else if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) {
-      g_lastDiscover = now;
+    } else if (now - g_lastWifiWarn >= WIFI_WARN_INTERVAL_MS) {
+      g_lastWifiWarn = now;   // at most once/min, not every discover cycle
       Serial.printf("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
                     WiFi.status());
     }
@@ -1539,9 +1603,9 @@ void loop() {
                       String(data.gas,         2);
 
     if (logger.log(dateStr + "," + timeStr + "," + dataLine)) {
-        Serial.println("Logged: " + dateStr + " " + timeStr);
+        if (BRIDGE_VERBOSE) Serial.println("Logged: " + dateStr + " " + timeStr);
     } else {
-        Serial.println("Log Failed");
+        Serial.println("Log Failed");   // keep failures
     }
 }
 

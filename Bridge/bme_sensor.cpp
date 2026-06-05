@@ -50,12 +50,10 @@ bool bmeUpdate() {
     currentData.gas         = bme.gas_resistance / 1000.0;
     currentData.valid       = true;
 
-    Serial.println("----- BME680 -----");
-    Serial.print("Temp: "); Serial.print(currentData.temperature); Serial.println(" C");
-    Serial.print("Humidity: "); Serial.print(currentData.humidity); Serial.println(" %");
-    Serial.print("Pressure: "); Serial.print(currentData.pressure); Serial.println(" hPa");
-    Serial.print("Gas: "); Serial.print(currentData.gas); Serial.println(" KOhm");
-    Serial.println("------------------");
+    // One concise line instead of a 6-line block (full data still logged to storage).
+    Serial.printf("[BME] %.1fC  %.1f%%RH  %.1fhPa  gas %.0fk\n",
+                  currentData.temperature, currentData.humidity,
+                  currentData.pressure, currentData.gas);
 
     return true;
 }
