@@ -45,10 +45,19 @@ Receives a new **C6 image pushed from the C3** in base64 chunks with stop-and-wa
 ACKs (`OTA_BEGIN/DATA/END/ABORT` -> `OTA_READY/ACK/DONE/ERR`), written via
 `esp_ota_*` to the two-OTA partition layout (`partitions.csv`).
 
-### 6. Sensor relay
+### 6. Sensor / environmental / crash relay
 The UDP listener receives sensor readings on the mesh (`ff03::2`, port **1234**)
-and prints `[UDP_RX] ... EUI=<hex>;t=<csv>` so the C3 can forward them to the
-display node. Periodically emits `C6_VERSION <n>` for the app's status view.
+and prints `[UDP_RX] ... EUI=<hex>;t=<csv>` so the C3 can forward them. Two more
+payload kinds ride the **same relay** so routers (which have no Wi-Fi) can reach
+the cloud via the gateway:
+- **`ENV <t>,<h>,<p>,<voc>`** from the C3 → `config_sync_send_env()` tags it with
+  the unit's own EUI64 and, on the Leader, loops it back as
+  `[UDP_RX] … ENV=<eui>;e=<csv>` (else UDP-relays it to the gateway).
+- **`CRASH <reason>|<pc>|<task>`** from the C3 → `config_sync_send_crash()`, same
+  pattern, surfacing as `[UDP_RX] … CRASH=<eui>;c=<payload>`.
+
+The gateway C3 turns these into `POST /v1/env` and `POST /v1/crashes`.
+Periodically emits `C6_VERSION <n>` for the app's status view.
 
 ## UART command reference (from the C3 / console)
 | Command | Effect |
@@ -57,6 +66,8 @@ display node. Periodically emits `C6_VERSION <n>` for the app's status view.
 | `FORM_NET` | form a new Thread network (idempotent) |
 | `add <eui> <pskd>` *(signed)* | admit a joiner |
 | `cfg_publish <ssid>|<pass>|<zone>|<net>|<pin>` | replicate creds + PIN |
+| `ENV <t>,<h>,<p>,<voc>` | relay this unit's BME sample to the gateway/cloud |
+| `CRASH <reason>|<pc>|<task>` | relay a firmware crash report to the gateway/cloud |
 | `ota_broadcast <url>` | sign + mesh-broadcast a fleet OTA |
 | `reset_broadcast` | sign + mesh-broadcast a fleet factory reset |
 | `OTA_BEGIN/OTA_DATA/OTA_END/OTA_ABORT` | receive a C6 image over UART |
@@ -67,7 +78,8 @@ display node. Periodically emits `C6_VERSION <n>` for the app's status view.
 - `thread_init.c` — boot role decision, network form/attach.
 - `joiner_role.c` — FTD router auto-join (joiner) path.
 - `commissioner.c` / `joiner_manager.c` — self-healing commissioning.
-- `config_sync.c/.h` — signed mesh replication (creds/PIN/OTA/reset).
+- `config_sync.c/.h` — signed mesh replication (creds/PIN/OTA/reset) + EUI-tagged
+  `config_sync_send_env()` / `config_sync_send_crash()` relays.
 - `ota_uart.c/.h` — UART OTA receiver.
 - `uart_rx.c` — command dispatch from the C3.
 - `config.h` — `COMMISSIONER_FW_VERSION`, `SECURE_HMAC_KEY`, `ROUTER_JOIN_PSKD`.
