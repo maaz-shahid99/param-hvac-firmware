@@ -55,3 +55,20 @@ void config_sync_broadcast_ota(const char *baseurl);
  * chips and reboots. Also triggers the local C3 (so the gateway resets too).
  */
 void config_sync_broadcast_reset(void);
+
+/**
+ * @brief Relay a BME environmental sample from our C3 toward the gateway/cloud.
+ *
+ * The C3 hands us "ENV <t>,<h>,<p>,<voc>" over UART; we tag it with our own
+ * factory EUI (so it matches the device roster) and deliver it: the Leader
+ * (active gateway) prints it straight to its own C3 for cloud forwarding; a
+ * plain router relays it over the mesh to the gateway's UDP listener (port 1234).
+ * Safe to call from a non-OpenThread task (acquires the lock itself).
+ */
+void config_sync_send_env(const char *payload);
+
+/**
+ * @brief Relay a firmware crash report from our C3 toward the gateway/cloud.
+ * Same routing as config_sync_send_env; payload is "<reset>|<pc>|<bt>".
+ */
+void config_sync_send_crash(const char *payload);

@@ -7,6 +7,14 @@
 #include <ArduinoJson.h>
 #include <nvs_flash.h>  // Added for full NVS wipe
 #include "mbedtls/base64.h"
+#include "esp_task_wdt.h"   // hardware task watchdog (hang protection)
+#include "esp_core_dump.h"  // read a saved panic core dump on boot (crash reporting)
+
+// Hardware task-watchdog toggle. If the unit boot-loops right after flashing
+// this firmware (resets ~every 30s with a "Task watchdog got triggered" panic),
+// set this to 0 and report it — the memory watchdog below still protects you.
+#define BRIDGE_ENABLE_TWDT 1
+#define BRIDGE_TWDT_TIMEOUT_S 30
 
 // Root CA (PEM) used to validate the cloud server's TLS certificate. Leave
 // empty to use setInsecure() — traffic is still encrypted, but the cert is not
@@ -26,7 +34,7 @@ static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 14
+#define BRIDGE_FW_VERSION 17
 
 // Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
 // commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
@@ -122,6 +130,8 @@ static bool bleShouldAdvertise();
 static void updateBleAdvertising();
 static void forwardReading(const String &eui, const String &data);
 static void forwardReadingCloud(const String &eui, const String &data);
+static void forwardEnvCloud(const String &eui, const String &csv);
+static void forwardCrashCloud(const String &eui, const String &payload);
 
 // --- Discovery / data-forwarding to the display node ---
 // The cloud discovery server address is fixed infrastructure baked into the
@@ -147,6 +157,19 @@ static const uint32_t DISCOVER_INTERVAL_MS = 10000;
 static const uint32_t WIFI_WARN_INTERVAL_MS = 60000;       // warn at most once/min while Wi-Fi is down
 static const uint32_t BEAT_INTERVAL_MS     = 10000;
 static const uint32_t MESH_PUSH_INTERVAL_MS = 30000;   // push router roster to cloud every 30s
+
+// Exponential backoff for the LAN display-node discovery when it keeps failing
+// (a down :8000 used to be re-hit every 10s forever, churning the heap). The
+// interval grows 10s->20->40->...->5min on consecutive failures and snaps back
+// to 10s on a success. The cloud path (:8002) is independent and unaffected.
+static uint32_t g_discoverIntervalMs = DISCOVER_INTERVAL_MS;
+static uint8_t  g_discFails          = 0;
+static const uint32_t DISCOVER_MAX_INTERVAL_MS = 300000;
+
+// Feature 1: how often this unit forwards its own BME sample over the mesh
+// toward the gateway/cloud. Defaults to 60s (the cloud collection interval).
+static uint32_t g_lastEnvSend = 0;
+static const uint32_t ENV_SEND_INTERVAL_MS = 60000;
 
 // --- Live "seen" sensor table -------------------------------------------------
 // Populated from the [UDP_RX] EUI stream we already relay to the display node.
@@ -200,6 +223,13 @@ static void performFleetOta(const String &baseurl);
 // lines, reported to the app via SYS?.  0=unknown, 1=active, 2=disabled.
 int g_commState = 0;
 volatile bool g_pendingReset = false;   // FACTORY_RESET requested from the BLE task
+volatile bool g_pendingScan  = false;   // SCAN? requested from the BLE task (run in loop)
+// Feature 3: a panic report captured at boot from the core-dump partition,
+// "<reset>|<pc>|<bt>". Relayed to the C6 (which tags our EUI) once on-network.
+static String g_crashPayload = "";
+static bool   g_crashSent    = false;
+static uint32_t g_lastCrashTry = 0;
+static uint8_t  g_crashTries   = 0;
 static void doFactoryReset();
 
 // Pending command tracking
@@ -246,7 +276,7 @@ static String stripTrailingSig(const String &line) {
 
 // --- Provisioning Logic (JSON Parsing & Wi-Fi) ---
 void handleProvisioning(const String &jsonPayload) {
-  DynamicJsonDocument doc(512);
+  DynamicJsonDocument doc(768);
   DeserializationError error = deserializeJson(doc, jsonPayload);
 
   if (error) {
@@ -262,11 +292,15 @@ void handleProvisioning(const String &jsonPayload) {
   const char *disc = doc["disc"];        // optional: discovery server URL override
   const char *cloud = doc["cloud"];      // optional: cloud alerting service base URL
   const char *cloudKey = doc["cloudKey"];// optional: per-site cloud API key
+  const char *wauth = doc["wauth"];      // optional: "psk" (default) | "peap"
+  const char *euser = doc["euser"];      // WPA2-Enterprise username (PEAP)
+  const char *eid = doc["eid"];          // WPA2-Enterprise outer identity (defaults to euser)
 
   if (!ssid || !pass || !netName) {
     bleNotifyLine("ERR MISSING_FIELDS");
     return;
   }
+  String authMode = (wauth && strcmp(wauth, "peap") == 0) ? "peap" : "psk";
 
   Serial.printf("[PROVISION] SSID: %s, Zone: %s, NetName: %s\n", SSID_LOG(ssid), zone, netName);
 
@@ -276,6 +310,10 @@ void handleProvisioning(const String &jsonPayload) {
   preferences.putString("pass", pass);
   preferences.putString("zone", zone ? zone : "Default");
   preferences.putString("net", netName);
+  // Wi-Fi auth mode + enterprise credentials (PEAP/MSCHAPv2).
+  preferences.putString("wauth", authMode);
+  preferences.putString("euser", (authMode == "peap" && euser) ? euser : "");
+  preferences.putString("eid", (authMode == "peap" && eid) ? eid : "");
   if (disc && strlen(disc) > 0) {
     preferences.putString("disc", disc);
     g_discoveryUrl = disc;
@@ -298,7 +336,8 @@ void handleProvisioning(const String &jsonPayload) {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
-  WiFi.begin(ssid, pass);
+  wifiBeginAuto(ssid, pass, authMode,
+                (euser ? String(euser) : String("")), (eid ? String(eid) : String("")));
 
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 20) {
@@ -339,16 +378,60 @@ void handleProvisioning(const String &jsonPayload) {
   }
 }
 
+// Connect with either WPA2-PSK or WPA2-Enterprise (PEAP/MSCHAPv2), per `wauth`.
+// For PEAP the password field carries the EAP password; `euser` is the username
+// and `eid` the (optional) outer identity (defaults to the username).
+static void wifiBeginAuto(const String &ssid, const String &pass,
+                          const String &wauth, const String &euser, const String &eid) {
+  if (wauth == "peap" && euser.length() > 0) {
+    String id = eid.length() ? eid : euser;
+    WiFi.begin(ssid.c_str(), WPA2_AUTH_PEAP, id.c_str(), euser.c_str(), pass.c_str());
+  } else {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  }
+}
+
 // --- Wi-Fi bring-up helper ---
 // Cleanly switches APs: dropping any prior association first makes re-provisioning
-// to a different SSID reliable on the ESP32.
+// to a different SSID reliable on the ESP32. Honours the stored auth type
+// (WPA2-PSK or WPA2-Enterprise PEAP) from NVS.
 static void applyWifi(const String &ssid, const String &pass) {
   if (ssid.length() == 0) return;
-  Serial.printf("[WIFI] (Re)connecting to %s...\n", SSID_LOG(ssid.c_str()));
+  preferences.begin("gateway_config", true);
+  String wauth = preferences.getString("wauth", "psk");
+  String euser = preferences.getString("euser", "");
+  String eid   = preferences.getString("eid", "");
+  preferences.end();
+  Serial.printf("[WIFI] (Re)connecting to %s [%s]...\n", SSID_LOG(ssid.c_str()), wauth.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  wifiBeginAuto(ssid, pass, wauth, euser, eid);
+}
+
+// Scan nearby Wi-Fi APs and reply in one notification for the app's picker:
+//   "WIFI|<ssid>:<rssi>:<enc>,..."   enc: 0=open, 1=secured(PSK), 2=enterprise.
+// Strongest-first, capped to the 256-byte MTU. Blocking — call only from loop().
+static void doWifiScan() {
+  WiFi.mode(WIFI_STA);
+  int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+  String out = "WIFI|";
+  bool first = true;
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    ssid.replace(",", " ");
+    ssid.replace(":", " ");
+    if (ssid.length() == 0) continue;
+    wifi_auth_mode_t m = WiFi.encryptionType(i);
+    int enc = (m == WIFI_AUTH_OPEN) ? 0 : (m == WIFI_AUTH_WPA2_ENTERPRISE ? 2 : 1);
+    String item = ssid + ":" + String((int)WiFi.RSSI(i)) + ":" + String(enc);
+    if (out.length() + item.length() + 2 > 250) break;
+    if (!first) out += ",";
+    out += item;
+    first = false;
+  }
+  WiFi.scanDelete();
+  bleNotifyLine(out);
 }
 
 // --- C6 -> C3: store replicated credentials (standby) ---
@@ -436,6 +519,8 @@ static void discoverNode() {
   if (!http.begin(g_discoveryUrl + "/discover")) return;
   int code = http.GET();
   if (code == 200) {
+    g_discFails = 0;                              // reachable again -> snap back to 10s
+    g_discoverIntervalMs = DISCOVER_INTERVAL_MS;
     DynamicJsonDocument doc(1024);
     if (!deserializeJson(doc, http.getString())) {
       JsonArray fwd = doc["forwarders"].as<JsonArray>();
@@ -451,7 +536,12 @@ static void discoverNode() {
       }
     }
   } else {
-    Serial.printf("[DISC] /discover failed (HTTP %d) @ %s\n", code, g_discoveryUrl.c_str());
+    if (g_discFails < 32) g_discFails++;
+    uint32_t mult = 1u << (g_discFails > 5 ? 5 : g_discFails);   // 1,2,4,8,16,32
+    g_discoverIntervalMs = DISCOVER_INTERVAL_MS * mult;
+    if (g_discoverIntervalMs > DISCOVER_MAX_INTERVAL_MS) g_discoverIntervalMs = DISCOVER_MAX_INTERVAL_MS;
+    Serial.printf("[DISC] /discover failed (HTTP %d) @ %s — backing off to %lus\n",
+                  code, g_discoveryUrl.c_str(), (unsigned long)(g_discoverIntervalMs / 1000));
   }
   http.end();
 }
@@ -473,7 +563,12 @@ static void heartbeatPresence() {
 
 // --- Forward one sensor reading to the display node (P2P on the LAN) ---
 static void forwardReading(const String &eui, const String &data) {
-  if (g_nodeUrl.isEmpty()) return;
+  // The cloud uplink is INDEPENDENT of the optional LAN display node — forward to
+  // the cloud first so readings still flow when no display node is running (the
+  // common appliance case). The display-node POST below is best-effort.
+  forwardReadingCloud(eui, data);
+
+  if (g_nodeUrl.isEmpty()) return;   // no display node discovered -> skip /ingest only
   HTTPClient http;
   http.setConnectTimeout(2000);
   http.setTimeout(2000);
@@ -489,7 +584,6 @@ static void forwardReading(const String &eui, const String &data) {
     Serial.printf("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
     g_nodeUrl = "";   // node unreachable -> force a re-discover (kept: it's an error)
   }
-  forwardReadingCloud(eui, data);
 }
 
 // --- Also forward the reading to the cloud alerting service (AWS), if set ---
@@ -497,36 +591,124 @@ static void forwardReading(const String &eui, const String &data) {
 // missing cloud config simply skips this (LAN dashboard keeps working alone).
 static void forwardReadingCloud(const String &eui, const String &data) {
   if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
-  HTTPClient http;
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
+  const String url  = g_cloudUrl + "/v1/readings";
+  const String body = String("{\"sensor_id\":\"") + eui + "\",\"data\":\"" + data + "\"}";
+  int code = 0;
 
-  // Use a TLS client for https:// (production), a plain client for http://
-  // (local bring-up). The secure client must outlive the request, so both are
-  // declared here on the stack.
-  WiFiClientSecure secure;
-  WiFiClient       plain;
-  bool began;
+  // Build the TLS client ONLY on the https path. Constructing a WiFiClientSecure
+  // on every plain-http reading needlessly allocates an mbedTLS context and
+  // fragments the heap over hours (a key cause of the C3's slow memory death).
   if (g_cloudUrl.startsWith("https://")) {
+    WiFiClientSecure secure;
     if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA);  // verify cert
     else                           secure.setInsecure();             // encrypt only
-    began = http.begin(secure, g_cloudUrl + "/v1/readings");
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(secure, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
   } else {
-    began = http.begin(plain, g_cloudUrl + "/v1/readings");
+    WiFiClient plain;
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(plain, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
   }
-  if (!began) return;
 
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", g_cloudKey);
-  String body = String("{\"sensor_id\":\"") + eui + "\",\"data\":\"" + data + "\"}";
-  int code = http.POST(body);
-  http.end();
   if (code > 0) {
     if (BRIDGE_VERBOSE)
       Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
   } else {
     Serial.printf("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
   }
+}
+
+// --- Forward a router/gateway BME sample to the cloud (Feature 1). Only the
+// active gateway runs this (it's the only unit that hears [UDP_RX]). `csv` is
+// "<temp>,<hum>,<pres>,<voc>". Memory-light: same http/https split as readings.
+static void forwardEnvCloud(const String &eui, const String &csv) {
+  if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
+  float t = 0, h = 0, p = 0, v = 0;
+  int i1 = csv.indexOf(','), i2 = csv.indexOf(',', i1 + 1), i3 = csv.indexOf(',', i2 + 1);
+  if (i1 > 0 && i2 > i1 && i3 > i2) {
+    t = csv.substring(0, i1).toFloat();
+    h = csv.substring(i1 + 1, i2).toFloat();
+    p = csv.substring(i2 + 1, i3).toFloat();
+    v = csv.substring(i3 + 1).toFloat();
+  }
+  const String url = g_cloudUrl + "/v1/env";
+  const String body = String("{\"sensor_id\":\"") + eui + "\",\"temp\":" + String(t, 2) +
+      ",\"hum\":" + String(h, 2) + ",\"pres\":" + String(p, 2) + ",\"voc\":" + String(v, 2) + "}";
+  int code = 0;
+  if (g_cloudUrl.startsWith("https://")) {
+    WiFiClientSecure secure;
+    if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA); else secure.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(secure, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
+  } else {
+    WiFiClient plain;
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(plain, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
+  }
+  if (code <= 0) Serial.printf("[ENV] %s -> /v1/env FAILED (%d)\n", eui.c_str(), code);
+  else if (BRIDGE_VERBOSE) Serial.printf("[ENV] %s -> /v1/env (%d)\n", eui.c_str(), code);
+}
+
+// --- Forward a firmware crash report to the cloud (Feature 3). Only the active
+// gateway runs this. `payload` is "<reset>|<pc>|<bt>". ---
+static void forwardCrashCloud(const String &eui, const String &payload) {
+  if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
+  int p1 = payload.indexOf('|'), p2 = payload.indexOf('|', p1 + 1);
+  String reset = p1 > 0 ? payload.substring(0, p1) : payload;
+  String pc = (p1 >= 0 && p2 > p1) ? payload.substring(p1 + 1, p2) : "";
+  String bt = (p2 >= 0) ? payload.substring(p2 + 1) : "";
+  const String url = g_cloudUrl + "/v1/crashes";
+  const String body = String("{\"sensor_id\":\"") + eui + "\",\"reset_reason\":\"" + reset +
+      "\",\"fw\":\"c3-v" + String(BRIDGE_FW_VERSION) + "\",\"pc\":\"" + pc +
+      "\",\"backtrace\":\"" + bt + "\"}";
+  int code = 0;
+  if (g_cloudUrl.startsWith("https://")) {
+    WiFiClientSecure secure;
+    if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA); else secure.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(secure, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
+  } else {
+    WiFiClient plain;
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+    if (!http.begin(plain, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", g_cloudKey);
+    code = http.POST(body);
+    http.end();
+  }
+  Serial.printf("[CRASH] %s -> /v1/crashes (%d)\n", eui.c_str(), code);
 }
 
 // --- Record that we just heard from a sensor EUI (for the NODES? dropdown) ---
@@ -1006,6 +1188,24 @@ static void handleCommissionerLine(const String &line) {
           if (BRIDGE_VERBOSE) Serial.printf("[SEEN+] %s\n", eui.c_str());   // diag (verbose only)
           if (isActiveGateway) forwardReading(eui, data);
         }
+      } else if (payload.startsWith("ENV=")) {
+        // Router/gateway BME relayed by the C6: "ENV=<eui>;e=<t>,<h>,<p>,<voc>"
+        int semi = payload.indexOf(';');
+        if (semi > 4) {
+          String eui = payload.substring(4, semi);
+          String e = payload.substring(semi + 1);       // "e=<t>,<h>,<p>,<voc>"
+          if (e.startsWith("e=")) e = e.substring(2);
+          if (isActiveGateway) forwardEnvCloud(eui, e);
+        }
+      } else if (payload.startsWith("CRASH=")) {
+        // Firmware crash relayed by the C6: "CRASH=<eui>;c=<reset>|<pc>|<bt>"
+        int semi = payload.indexOf(';');
+        if (semi > 6) {
+          String eui = payload.substring(6, semi);
+          String c = payload.substring(semi + 1);        // "c=<reset>|<pc>|<bt>"
+          if (c.startsWith("c=")) c = c.substring(2);
+          if (isActiveGateway) forwardCrashCloud(eui, c);
+        }
       }
     }
     return; // handled
@@ -1227,7 +1427,15 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     // state) — no secrets, no control — so the app can populate its Devices view
     // and the assign dropdown the moment it connects, even before unlocking.
     bool isReadOnlyQuery = (sCmd == "NODES?" || sCmd == "ROUTERS?" || sCmd == "SYS?" ||
-                          sCmd.startsWith("PROBES?"));
+                          sCmd == "SCAN?" || sCmd.startsWith("PROBES?"));
+
+    // SCAN? — list nearby Wi-Fi networks for the Router Setup picker. Scanning is
+    // blocking (~2-4s), so defer to loop() and notify the result there.
+    if (sCmd == "SCAN?") {
+      g_pendingScan = true;
+      bleNotifyLine("STATUS SCANNING");
+      return;
+    }
 
     // ==========================================
     // 3. THE GATEKEEPER
@@ -1471,6 +1679,130 @@ void deinitBLE() {
   Serial.println("[BLE] Stack De-initialized (Secure Mode).");
 }
 
+// ===========================================================================
+// HEALTH / MEMORY WATCHDOG
+// The C3 runs BLE + Wi-Fi + HTTP in ~400 KB RAM. Over many hours the heap can
+// fragment/exhaust until Wi-Fi's allocator faults (Guru Meditation in
+// esf_buf_alloc_dynamic) and BLE advertising silently dies. Instead of letting
+// it hard-crash unpredictably, we watch free heap + the largest free block and
+// GRACEFULLY reboot just before the danger zone (and once every 12h as a
+// backstop). A reboot is a clean ~3s recovery: BLE re-advertises and the C6/mesh
+// + cloud reconnect on their own. We also re-assert advertising if it ever stops
+// while it should be up, so the app is never permanently locked out.
+// ===========================================================================
+static const uint32_t HEALTH_CHECK_MS       = 5000;     // evaluate every 5s
+static const uint32_t HEALTH_LOG_MS         = 60000;    // print a [HEAP] line each 60s
+static const uint32_t HEALTH_FREE_FLOOR     = 16000;    // free heap < 16 KB  => danger
+static const uint32_t HEALTH_BLOCK_FLOOR    = 12000;    // largest block < 12 KB => danger
+static const uint32_t HEALTH_PERSIST_MS     = 8000;     // stay critical this long (ignore blips)
+static const uint32_t HEALTH_FORCE_AFTER_MS = 120000;   // reboot even with a client connected after this
+static const uint32_t HEALTH_MAX_UPTIME_MS  = 12UL * 60 * 60 * 1000;  // 12h idle backstop
+
+static uint32_t g_healthLastCheck = 0;
+static uint32_t g_healthLastLog   = 0;
+static uint32_t g_criticalSince   = 0;   // millis when memory first went critical (0 = healthy)
+
+static void safeReboot(const char *why) {
+  Serial.printf("[HEALTH] REBOOT: %s (free=%u largest=%u up=%lus)\n",
+                why, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+                (unsigned long)(millis() / 1000));
+  Serial.flush();
+  delay(150);
+  ESP.restart();   // does not return
+}
+
+// Re-assert advertising if this unit SHOULD be advertising but isn't.
+static void bleSelfHeal() {
+  if (!bleShouldAdvertise()) return;
+  if (!bleStackUp) { updateBleAdvertising(); return; }
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  if (adv && !adv->isAdvertising() && !bleClientConnected) {
+    NimBLEDevice::startAdvertising();
+    Serial.println("[BLE] self-heal: advertising was down -> restarted.");
+  }
+}
+
+static void healthMonitor() {
+  uint32_t now = millis();
+  if (now - g_healthLastCheck < HEALTH_CHECK_MS) return;
+  g_healthLastCheck = now;
+
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t largest  = ESP.getMaxAllocHeap();
+
+  if (now - g_healthLastLog >= HEALTH_LOG_MS) {
+    g_healthLastLog = now;
+    Serial.printf("[HEAP] free=%u min=%u largest=%u up=%lus\n",
+                  freeHeap, ESP.getMinFreeHeap(), largest, (unsigned long)(now / 1000));
+  }
+
+  bleSelfHeal();
+
+  // Never reboot mid firmware-update.
+  if (g_pendingOta != 0 || g_fleetOtaPending) { g_criticalSince = 0; return; }
+
+  // 12h proactive backstop, only when no app is connected (zero disruption).
+  if (now >= HEALTH_MAX_UPTIME_MS && !bleClientConnected) {
+    safeReboot("12h uptime backstop");
+  }
+
+  // Memory danger zone — debounced so a momentary RX burst doesn't trip it.
+  bool critical = (freeHeap < HEALTH_FREE_FLOOR) || (largest < HEALTH_BLOCK_FLOOR);
+  if (!critical) { g_criticalSince = 0; return; }
+  if (g_criticalSince == 0) {
+    g_criticalSince = now;
+    Serial.printf("[HEALTH] memory critical (free=%u largest=%u) — reboot pending\n", freeHeap, largest);
+    return;
+  }
+  if (now - g_criticalSince < HEALTH_PERSIST_MS) return;          // wait out a blip
+  if (!bleClientConnected) safeReboot("memory critical");
+  else if (now - g_criticalSince >= HEALTH_FORCE_AFTER_MS)
+    safeReboot("memory critical (client connected)");
+}
+
+// --- Feature 3: capture a saved panic core dump at boot ---------------------
+// The Arduino min_spiffs scheme already has a `coredump` partition, so a panic
+// is saved there automatically. On the next boot we read its summary (PC +
+// backtrace), stash it, and relay it to the cloud (via the C6) once on-network.
+static void captureCrashAtBoot() {
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char *reason;
+  switch (rr) {
+    case ESP_RST_PANIC:    reason = "panic";    break;
+    case ESP_RST_INT_WDT:  reason = "int_wdt";  break;
+    case ESP_RST_TASK_WDT: reason = "task_wdt"; break;
+    case ESP_RST_WDT:      reason = "wdt";      break;
+    case ESP_RST_BROWNOUT: reason = "brownout"; break;
+    case ESP_RST_SW:       reason = "sw";       break;
+    case ESP_RST_POWERON:  reason = "poweron";  break;
+    default:               reason = "other";    break;
+  }
+  Serial.printf("[BOOT] reset reason: %s\n", reason);
+
+  String pc = "", bt = "";
+  if (esp_core_dump_image_check() == ESP_OK) {
+    esp_core_dump_summary_t *sum =
+        (esp_core_dump_summary_t *) malloc(sizeof(esp_core_dump_summary_t));
+    if (sum && esp_core_dump_get_summary(sum) == ESP_OK) {
+      char tmp[24];
+      snprintf(tmp, sizeof(tmp), "0x%08x", (unsigned)sum->exc_pc);
+      pc = tmp;
+      // RISC-V (C3) doesn't fill a backtrace array (that's Xtensa-only); the
+      // faulting PC + crashing task name is enough to addr2line the site.
+      bt = String("task=") + String(sum->exc_task);
+    }
+    if (sum) free(sum);
+    esp_core_dump_image_erase();   // report it once
+  }
+
+  bool isCrash = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+                  rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT);
+  if (isCrash || pc.length() > 0) {
+    g_crashPayload = String(reason) + "|" + pc + "|" + bt;
+    Serial.printf("[CRASH] captured: %s pc=%s\n", reason, pc.c_str());
+  }
+}
+
 // --- Main ---
 void setup() {
   Serial.begin(115200);
@@ -1491,6 +1823,7 @@ void setup() {
 
   Serial.println("\n[BOOT] Bridge Starting...");
   Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?/PROBES?; 30s live window\n", BRIDGE_FW_VERSION);
+  captureCrashAtBoot();   // Feature 3: read a saved panic core dump, forward later
 
   // Initialize Authentication Defaults if first boot
   preferences.begin(AUTH_NAMESPACE, false);
@@ -1524,9 +1857,28 @@ void setup() {
     Serial.printf("[BOOT] Wi-Fi creds present (SSID: %s). Waiting for GW_ROLE from Commissioner...\n",
                   SSID_LOG(savedSSID.c_str()));
   }
+
+  Serial.printf("[BOOT] free heap: %u bytes\n", ESP.getFreeHeap());
+#if BRIDGE_ENABLE_TWDT
+  // Widen the Arduino default 5s TWDT and subscribe the loop task, so a true
+  // hang (not just low memory) also auto-recovers. OTA brackets this in loop().
+  esp_task_wdt_config_t twdt = {
+    .timeout_ms = BRIDGE_TWDT_TIMEOUT_S * 1000,
+    .idle_core_mask = (1 << 0),
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&twdt);
+  esp_task_wdt_add(NULL);
+  Serial.printf("[BOOT] task watchdog armed (%ds).\n", BRIDGE_TWDT_TIMEOUT_S);
+#endif
 }
 
 void loop() {
+#if BRIDGE_ENABLE_TWDT
+  esp_task_wdt_reset();   // we're alive
+#endif
+  healthMonitor();        // heap watch + graceful reboot + BLE self-heal
+
   // ==========================================
   // 0. FACTORY RESET LOGIC (1-Second Hold)
   // ==========================================
@@ -1548,6 +1900,12 @@ void loop() {
   static char lineBuf[UART_MAX_LINE_LEN];
   static size_t lineLen = 0;
 
+#if BRIDGE_ENABLE_TWDT
+  bool _otaThisLoop = (g_pendingOta != 0) ||
+                      (g_fleetOtaPending && (int32_t)(millis() - g_fleetOtaAt) >= 0);
+  if (_otaThisLoop) esp_task_wdt_delete(NULL);   // OTA blocks for minutes; don't trip the WDT
+#endif
+
   // 0b. Run any queued OTA here (loop context = single Serial1 owner). The C6
   //     push reads OTA_ACK lines synchronously, so it must not race loop()'s read.
   if (g_pendingOta != 0) {
@@ -1563,11 +1921,32 @@ void loop() {
     Serial.println("[FLEETOTA] starting self-update...");
     performFleetOta(g_fleetOtaBaseUrl);
   }
+#if BRIDGE_ENABLE_TWDT
+  if (_otaThisLoop) { esp_task_wdt_add(NULL); esp_task_wdt_reset(); }
+#endif
 
   // 0d. Factory reset requested over BLE — run from loop() then reboot.
   if (g_pendingReset) {
     g_pendingReset = false;
     doFactoryReset();   // does not return
+  }
+
+  // 0e. Wi-Fi scan requested over BLE (blocking) — run here, notify the result.
+  if (g_pendingScan) {
+    g_pendingScan = false;
+    doWifiScan();
+  }
+
+  // 0f. Relay a captured boot crash report to the C6 (which tags our EUI and
+  //     routes it to the gateway/cloud). The gateway forwards it itself, so wait
+  //     for Wi-Fi (it isn't up the instant we become gateway) and retry a few
+  //     times; a router relays via the mesh and doesn't need its own Wi-Fi.
+  if (!g_crashSent && g_crashPayload.length() > 0 && c6OnNetwork &&
+      (!isActiveGateway || WiFi.status() == WL_CONNECTED) &&
+      (g_crashTries == 0 || millis() - g_lastCrashTry >= 20000)) {
+    g_lastCrashTry = millis();
+    Serial1.printf("CRASH %s\n", g_crashPayload.c_str());
+    if (++g_crashTries >= 6) g_crashSent = true;   // best-effort: give up after ~100s
   }
 
   // 1. Switch Logic
@@ -1636,8 +2015,10 @@ void loop() {
   if (isActiveGateway) {
     uint32_t now = millis();
     if (WiFi.status() == WL_CONNECTED) {
-      if (now - g_lastDiscover >= DISCOVER_INTERVAL_MS) { g_lastDiscover = now; discoverNode(); }
-      if (now - g_lastBeat     >= BEAT_INTERVAL_MS)     { g_lastBeat = now;     heartbeatPresence(); }
+      if (now - g_lastDiscover >= g_discoverIntervalMs) { g_lastDiscover = now; discoverNode(); }
+      // Skip the presence heartbeat while discovery is clearly down (same server)
+      // so we don't churn a failing connection every 10s.
+      if (g_discFails < 2 && now - g_lastBeat >= BEAT_INTERVAL_MS) { g_lastBeat = now; heartbeatPresence(); }
       if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
     } else if (now - g_lastWifiWarn >= WIFI_WARN_INTERVAL_MS) {
       g_lastWifiWarn = now;   // at most once/min, not every discover cycle
@@ -1679,6 +2060,15 @@ void loop() {
         if (BRIDGE_VERBOSE) Serial.println("Logged: " + dateStr + " " + timeStr);
     } else {
         Serial.println("Log Failed");   // keep failures
+    }
+
+    // Feature 1: forward this BME sample toward the gateway/cloud over the mesh.
+    // The C6 tags it with our EUI and routes it (router -> gateway -> cloud; the
+    // gateway loops its own back). Interval-gated so it doesn't flood the UART.
+    if (c6OnNetwork && millis() - g_lastEnvSend >= ENV_SEND_INTERVAL_MS) {
+      g_lastEnvSend = millis();
+      Serial1.printf("ENV %s\n", dataLine.c_str());      // "ENV <t>,<h>,<p>,<voc>"
+      Serial.printf("[ENV->C6] %s (gw=%d)\n", dataLine.c_str(), isActiveGateway);  // debug
     }
 }
 

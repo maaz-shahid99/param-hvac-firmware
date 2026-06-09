@@ -227,6 +227,78 @@ static void send_multicast_locked(const char *payload)
     send_payload_locked(payload, &addr);
 }
 
+// ---- Router/gateway environmental (BME) relay --------------------------
+void config_sync_send_env(const char *payload)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) return;
+    otInstance *inst = esp_openthread_get_instance();
+    char eui[17];
+    own_eui64(eui);
+    otDeviceRole role = otThreadGetDeviceRole(inst);
+
+    char line[300];
+    snprintf(line, sizeof(line), "ENV=%s;e=%s", eui, payload ? payload : "");
+
+    if (role == OT_DEVICE_ROLE_LEADER) {
+        // We ARE the gateway — hand it straight to our own C3 to forward.
+        esp_openthread_lock_release();
+        printf("[UDP_RX] From [self]:0 -> %s\n", line);
+        fflush(stdout);
+        return;
+    }
+
+    // Plain router — relay to the gateway over the mesh (sensor/env port 1234).
+    otMessage *msg = otUdpNewMessage(inst, NULL);
+    if (msg) {
+        if (otMessageAppend(msg, line, strlen(line)) == OT_ERROR_NONE) {
+            otMessageInfo info;
+            memset(&info, 0, sizeof(info));
+            otIp6AddressFromString("ff03::2", &info.mPeerAddr);
+            info.mPeerPort = 1234;
+            if (otUdpSend(inst, &s_sock, msg, &info) != OT_ERROR_NONE)
+                otMessageFree(msg);
+        } else {
+            otMessageFree(msg);
+        }
+    }
+    esp_openthread_lock_release();
+}
+
+// ---- Firmware crash report relay (mirrors config_sync_send_env) ---------
+void config_sync_send_crash(const char *payload)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) return;
+    otInstance *inst = esp_openthread_get_instance();
+    char eui[17];
+    own_eui64(eui);
+    otDeviceRole role = otThreadGetDeviceRole(inst);
+
+    char line[400];
+    snprintf(line, sizeof(line), "CRASH=%s;c=%s", eui, payload ? payload : "");
+
+    if (role == OT_DEVICE_ROLE_LEADER) {
+        esp_openthread_lock_release();
+        printf("[UDP_RX] From [self]:0 -> %s\n", line);
+        fflush(stdout);
+        return;
+    }
+
+    otMessage *msg = otUdpNewMessage(inst, NULL);
+    if (msg) {
+        if (otMessageAppend(msg, line, strlen(line)) == OT_ERROR_NONE) {
+            otMessageInfo info;
+            memset(&info, 0, sizeof(info));
+            otIp6AddressFromString("ff03::2", &info.mPeerAddr);
+            info.mPeerPort = 1234;
+            if (otUdpSend(inst, &s_sock, msg, &info) != OT_ERROR_NONE)
+                otMessageFree(msg);
+        } else {
+            otMessageFree(msg);
+        }
+    }
+    esp_openthread_lock_release();
+}
+
 // ---- Parse + verify an incoming "CFG|..." blob into *out ---------------
 static bool parse_and_verify(const char *msg, cfg_blob_t *out)
 {

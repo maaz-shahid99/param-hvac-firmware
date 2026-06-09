@@ -154,6 +154,26 @@ static void process_command(char *raw_input) {
         return;
     }
 
+    // C3 -> C6: a BME environmental sample to relay toward the gateway/cloud.
+    // Format: "ENV <t>,<h>,<p>,<voc>"  (config_sync tags it with our own EUI).
+    if (token && strcmp(token, "ENV") == 0) {
+        const char *payload = raw_input + strlen("ENV");
+        while (*payload == ' ') payload++;
+        config_sync_send_env(payload);
+        free(cmd_copy);
+        return;
+    }
+
+    // C3 -> C6: a firmware crash report to relay toward the gateway/cloud.
+    // Format: "CRASH <reset>|<pc>|<bt>"  (config_sync tags it with our own EUI).
+    if (token && strcmp(token, "CRASH") == 0) {
+        const char *payload = raw_input + strlen("CRASH");
+        while (*payload == ' ') payload++;
+        config_sync_send_crash(payload);
+        free(cmd_copy);
+        return;
+    }
+
     free(cmd_copy);
 
     // 2. SIGNED Commands
