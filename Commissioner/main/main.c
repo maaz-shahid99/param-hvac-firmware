@@ -1,4 +1,5 @@
 #include "config.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -61,8 +62,16 @@ static void ot_task_worker(void *arg)
 
 void app_main(void)
 {
-    // OTA TEST MARKER — if you see this line on boot, the new firmware is running.
-    ESP_LOGW(TAG, "=== Commissioner OTA TEST BUILD v8===");
+    ESP_LOGI(TAG, "=== Commissioner firmware v%d ===", COMMISSIONER_FW_VERSION);
+
+    // Production guard: the command-signing HMAC key is shared with the app and
+    // gates commissioning. Refuse to ship with the public placeholder — anyone
+    // could forge `add`/reset commands. Change it in config.h AND in the app
+    // (matching value), then rebuild + reflash the fleet.
+    if (strcmp(SECURE_HMAC_KEY, "PROD_SECRET_KEY_CHANGE_ME") == 0) {
+        ESP_LOGE(TAG, "SECURITY: SECURE_HMAC_KEY is the default PLACEHOLDER — set a "
+                      "strong unique key before production (match it in the app).");
+    }
 
     // 1. Initialize Watchdog (Optional, enable if production requires strict timeouts)
     // esp_task_wdt_init(10, true);
