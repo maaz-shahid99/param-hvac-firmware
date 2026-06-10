@@ -34,7 +34,7 @@ static const char *CLOUD_ROOT_CA = "";
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest.
-#define BRIDGE_FW_VERSION 17
+#define BRIDGE_FW_VERSION 19
 
 // Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
 // commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
@@ -217,6 +217,15 @@ int      g_c6Version       = -1;     // reported by the C6 ("C6_VERSION n"); -1 
 bool     g_fleetOtaPending = false;
 String   g_fleetOtaBaseUrl;
 uint32_t g_fleetOtaAt      = 0;
+
+// Gateway OTA poll: ask the cloud for a firmware job. Canary builds self-update
+// the gateway first; full builds broadcast to the fleet. g_bcast* remembers the
+// version we last broadcast so we don't re-trigger every poll (version-gating on
+// each unit prevents re-applying anyway).
+uint32_t g_lastOtaPoll = 0;
+int      g_bcastC3     = 0;   // highest c3 version broadcast to the fleet
+int      g_bcastC6     = 0;   // highest c6 version broadcast to the fleet
+static const uint32_t OTA_POLL_INTERVAL_MS = 300000;   // 5 min
 static void performFleetOta(const String &baseurl);
 
 // Latest commissioner state, tracked from the C6's "COMMISSIONER STATE UPDATE"
@@ -813,9 +822,86 @@ static void forwardMeshCloud() {
   if (!began) return;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-API-Key", g_cloudKey);
-  int code = http.POST(String("{\"nodes\":[") + arr + "]}");
+  // Piggyback the gateway's self-report (firmware versions, heap, role) so the
+  // support console can show fleet health + the OTA "is there a newer build".
+  String body = String("{\"nodes\":[") + arr + "],"
+              + "\"fw_c3\":" + String(BRIDGE_FW_VERSION) + ","
+              + "\"fw_c6\":" + String(g_c6Version >= 0 ? g_c6Version : 0) + ","
+              + "\"heap_free\":" + String((uint32_t)ESP.getFreeHeap()) + ","
+              + "\"role\":\"" + (isActiveGateway ? "LEADER" : "STANDBY") + "\"}";
+  int code = http.POST(body);
   http.end();
   Serial.printf("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+}
+
+// --- Gateway: poll the cloud for a tiered firmware OTA job ------------------
+// Mandatory builds auto-roll; optional builds apply only once the customer
+// approved them (cloud returns approved_c3/c6). Rollout is staged:
+//   stage=canary -> the GATEWAY self-updates first (verify-first), no broadcast;
+//   stage=full   -> the gateway tells its C6 to sign + mesh-broadcast a fleet OTA
+//                   sourced from the cloud's /firmware/ (every unit self-updates).
+// After a canary self-update the gateway reboots onto the new build (version-gating
+// then stops the self path); on Promote (stage->full) g_bcast* is 0 post-reboot so
+// the gateway broadcasts to the still-behind fleet (which version-gate-skips it).
+static void pollOtaJob() {
+  if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
+  if (!isActiveGateway || WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(4000);
+  WiFiClientSecure secure;
+  WiFiClient       plain;
+  bool began;
+  if (g_cloudUrl.startsWith("https://")) {
+    if (strlen(CLOUD_ROOT_CA) > 0) secure.setCACert(CLOUD_ROOT_CA);
+    else                           secure.setInsecure();
+    began = http.begin(secure, g_cloudUrl + "/v1/ota/check");
+  } else {
+    began = http.begin(plain, g_cloudUrl + "/v1/ota/check");
+  }
+  if (!began) return;
+  http.addHeader("X-API-Key", g_cloudKey);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return; }
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) return;
+
+  if (g_fleetOtaPending) return;               // an OTA is already scheduled/running
+
+  int c3v = doc["c3_version"] | 0;
+  int c6v = doc["c6_version"] | 0;
+  String c3sev = String((const char *)(doc["c3_severity"] | "optional"));
+  String c6sev = String((const char *)(doc["c6_severity"] | "optional"));
+  String c3stage = String((const char *)(doc["c3_stage"] | "full"));
+  String c6stage = String((const char *)(doc["c6_stage"] | "full"));
+  int appC3 = doc["approved_c3"] | 0;
+  int appC6 = doc["approved_c6"] | 0;
+
+  // A build we're allowed to roll (mandatory, or an approved optional).
+  bool okC3 = (c3v > 0) && (c3sev == "mandatory" || appC3 >= c3v);
+  bool okC6 = (c6v > 0) && (c6sev == "mandatory" || appC6 >= c6v);
+  // Canary: the gateway updates ITSELF first, only while it's still behind.
+  bool selfC3 = okC3 && c3stage == "canary" && c3v > BRIDGE_FW_VERSION;
+  bool selfC6 = okC6 && c6stage == "canary" && g_c6Version >= 0 && c6v > g_c6Version;
+  // Full: broadcast to the fleet, once per version (independent of OUR version,
+  // since the routers may be behind even after the gateway self-updated a canary).
+  bool fleetC3 = okC3 && c3stage == "full" && c3v > g_bcastC3;
+  bool fleetC6 = okC6 && c6stage == "full" && c6v > g_bcastC6;
+
+  if (selfC3 || selfC6) {
+    Serial.printf("[OTAPOLL] canary -> gateway self-update (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
+    g_fleetOtaBaseUrl = g_cloudUrl;            // self-update only: no ota_broadcast
+    g_fleetOtaAt = millis() + 3000;
+    g_fleetOtaPending = true;
+  } else if (fleetC3 || fleetC6) {
+    if (fleetC3) g_bcastC3 = c3v;
+    if (fleetC6) g_bcastC6 = c6v;
+    Serial.printf("[OTAPOLL] full -> fleet OTA broadcast (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
+    Serial1.println("ota_broadcast " + g_cloudUrl);   // C6 signs + multicasts OTA_NOW <cloud>
+  }
 }
 
 // --- Register an EUI -> box/slot mapping on the display node (commissioning) ---
@@ -2020,6 +2106,7 @@ void loop() {
       // so we don't churn a failing connection every 10s.
       if (g_discFails < 2 && now - g_lastBeat >= BEAT_INTERVAL_MS) { g_lastBeat = now; heartbeatPresence(); }
       if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
+      if (now - g_lastOtaPoll  >= OTA_POLL_INTERVAL_MS) { g_lastOtaPoll = now;  pollOtaJob(); }
     } else if (now - g_lastWifiWarn >= WIFI_WARN_INTERVAL_MS) {
       g_lastWifiWarn = now;   // at most once/min, not every discover cycle
       Serial.printf("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
