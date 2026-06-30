@@ -71,6 +71,15 @@ static const int SWITCH_PIN = 2;
 static const int RESET_BTN_PIN = 9;  // BOOT button for factory reset
 // TOGGLE SWITCH: HIGH = Setup (Commissioner Mode), LOW = Secure (Gateway Mode)
 
+// Gateway/Uplink status LED — the one C3-driven LED of the router's four (the
+// other three are Power [3V3 rail] + Commissioner & System [C6 GPIO15/GPIO2]).
+// External LED on the C3's only free pin, GPIO5 / silk "D3", active-HIGH:
+//   off        = standby (not the active gateway)
+//   fast blink = active gateway, Wi-Fi connecting
+//   slow blink = Wi-Fi up but the cloud is unreachable
+//   solid      = active gateway, Wi-Fi + cloud up
+static const int UPLINK_LED_PIN = 5;
+
 // --- UUIDs ---
 static const char *SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 static const char *CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
@@ -149,6 +158,7 @@ static String   g_nodeUrl      = "";                        // discovered displa
 #define DEFAULT_CLOUD_URL ""                                // e.g. https://api.yourdomain.com
 static String   g_cloudUrl     = DEFAULT_CLOUD_URL;
 static String   g_cloudKey     = "";                        // X-API-Key -> tenant on the cloud
+static volatile bool g_cloudOk = true;                      // last cloud POST reached the server (drives the uplink LED)
 static uint32_t g_lastDiscover = 0;
 static uint32_t g_lastBeat     = 0;
 static uint32_t g_lastMesh     = 0;
@@ -631,12 +641,34 @@ static void forwardReadingCloud(const String &eui, const String &data) {
     http.end();
   }
 
+  g_cloudOk = (code > 0);   // reached the server (any HTTP response) -> uplink LED solid
   if (code > 0) {
     if (BRIDGE_VERBOSE)
       Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
   } else {
     Serial.printf("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
   }
+}
+
+// --- Gateway/Uplink status LED (GPIO5). Non-blocking; self-throttled to ~40 Hz.
+// Renders from the gateway role + Wi-Fi + cloud-reachability we already track.
+static void updateUplinkLed() {
+  static uint32_t lastTick = 0;
+  const uint32_t now = millis();
+  if (now - lastTick < 25) return;
+  lastTick = now;
+
+  bool on;
+  if (!isActiveGateway) {
+    on = false;                              // standby: off
+  } else if (WiFi.status() != WL_CONNECTED) {
+    on = ((now / 120) % 2) == 0;             // Wi-Fi connecting: fast blink
+  } else if (!g_cloudOk) {
+    on = ((now / 500) % 2) == 0;             // cloud unreachable: slow blink
+  } else {
+    on = true;                               // gateway + cloud up: solid
+  }
+  digitalWrite(UPLINK_LED_PIN, on ? HIGH : LOW);
 }
 
 // --- Forward a router/gateway BME sample to the cloud (Feature 1). Only the
@@ -1906,6 +1938,8 @@ void setup() {
 
   pinMode(SWITCH_PIN, INPUT_PULLUP);
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
+  pinMode(UPLINK_LED_PIN, OUTPUT);
+  digitalWrite(UPLINK_LED_PIN, LOW);   // off until we become the active gateway
 
   Serial.println("\n[BOOT] Bridge Starting...");
   Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?/PROBES?; 30s live window\n", BRIDGE_FW_VERSION);
@@ -1964,6 +1998,7 @@ void loop() {
   esp_task_wdt_reset();   // we're alive
 #endif
   healthMonitor();        // heap watch + graceful reboot + BLE self-heal
+  updateUplinkLed();      // gateway/Wi-Fi/cloud status LED (GPIO5)
 
   // ==========================================
   // 0. FACTORY RESET LOGIC (1-Second Hold)

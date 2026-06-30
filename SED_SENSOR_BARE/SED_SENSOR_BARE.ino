@@ -86,9 +86,63 @@ static void start_joiner_locked(otInstance *inst) {
   }
 }
 
+// --- STATUS LEDS (3 discrete) ----------------------------------------------
+// Three individual (single-colour) LEDs give at-a-glance status without serial:
+//
+//   * POWER   (green) — solid once the firmware is running. (May instead be wired
+//                       straight to the 3V3 rail; then drop LED_PWR_PIN below.)
+//   * NETWORK (blue)  — ~1.25 Hz blink while joining/attaching, solid once
+//                       attached to the mesh as a CHILD (i.e. reporting).
+//   * FAULT   (red)   — solid on a permanent join failure (e.g. PSKd mismatch),
+//                       brief blink on a transient error (DS18B20 err / UDP TX fail).
+//
+// Wiring: each pin -> resistor -> LED -> GND (active-HIGH). D4 is the OneWire bus,
+// so it is avoided. Pins are XIAO ESP32-C6 pads; adjust to match your board. Set
+// LED_ACTIVE_LOW to 1 for active-LOW (common-anode) wiring.
+#define LED_PWR_PIN     D1   // green  — power / firmware alive
+#define LED_NET_PIN     D2   // blue   — network / join status
+#define LED_FAULT_PIN   D3   // red    — fault
+#define LED_ACTIVE_LOW   0
+
+volatile bool     g_child            = false;  // attached as CHILD -> NETWORK solid
+volatile uint32_t g_fault_blink_until = 0;     // ms; transient-error blink window
+
+static inline void ledWrite(int pin, bool on) {
+  digitalWrite(pin, (on ^ (LED_ACTIVE_LOW != 0)) ? HIGH : LOW);
+}
+
+static void setupLeds() {
+  pinMode(LED_PWR_PIN,   OUTPUT);
+  pinMode(LED_NET_PIN,   OUTPUT);
+  pinMode(LED_FAULT_PIN, OUTPUT);
+  ledWrite(LED_PWR_PIN,   true);    // power / alive
+  ledWrite(LED_NET_PIN,   false);
+  ledWrite(LED_FAULT_PIN, false);
+}
+
+// Non-blocking; call every loop(). Renders blink patterns from millis().
+static void renderLeds() {
+  const uint32_t t = millis();
+
+  ledWrite(LED_PWR_PIN, true);                       // power: solid
+
+  bool net_on;                                       // network / join status
+  if (g_failed)      net_on = false;                 // (fault LED takes over)
+  else if (g_child)  net_on = true;                  // solid: attached & reporting
+  else               net_on = ((t / 400) % 2) == 0;  // ~1.25 Hz: joining/attaching
+  ledWrite(LED_NET_PIN, net_on);
+
+  bool fault_on;                                     // fault
+  if (g_failed)                                    fault_on = true;                  // solid
+  else if ((int32_t)(g_fault_blink_until - t) > 0) fault_on = ((t / 150) % 2) == 0;  // blink
+  else                                             fault_on = false;
+  ledWrite(LED_FAULT_PIN, fault_on);
+}
+
 // --- SETUP ---
 void setup() {
   Serial.begin(115200);
+  setupLeds();              // 3 status LEDs: power on, network/fault off
   delay(2000);
 
   // Initialize Dallas Temperature Library
@@ -129,8 +183,7 @@ void setup() {
     Serial.println("[FATAL] Could not acquire OT lock in setup!");
     return;
   }
-
-  otInstance *inst = esp_openthread_get_instance();
+r   otInstance *inst = esp_openthread_get_instance();
 
   // 2. CHECK FOR EXISTING CREDENTIALS FIRST
   otOperationalDataset activeDataset;
@@ -234,6 +287,7 @@ void loop() {
       if (emitted > 0) strcat(payload, ",");
       if (temp == DEVICE_DISCONNECTED_C) {
         snprintf(tempStr, sizeof(tempStr), "%s:err", romStr);
+        g_fault_blink_until = millis() + 1500;   // FAULT LED: brief blink on a dead probe
       } else {
         snprintf(tempStr, sizeof(tempStr), "%s:%.1f", romStr, temp);
       }
@@ -245,6 +299,7 @@ void loop() {
     if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
       otInstance *inst = esp_openthread_get_instance();
       otDeviceRole currentRole = otThreadGetDeviceRole(inst);
+      g_child = (currentRole == OT_DEVICE_ROLE_CHILD);  // NETWORK LED: solid when attached
 
       // Only send data if attached to the mesh as a CHILD
       if (currentRole == OT_DEVICE_ROLE_CHILD) {
@@ -272,6 +327,7 @@ void loop() {
             Serial.printf("[UDP] Packet sent: %s\n", payload);
           } else {
             Serial.printf("[UDP] Send failed: %d\n", sendErr);
+            g_fault_blink_until = millis() + 1500;   // FAULT LED: brief blink on TX failure
             otMessageFree(msg);
           }
         }
@@ -280,5 +336,6 @@ void loop() {
     }
   }
 
+  renderLeds();   // update the 3 status LEDs (non-blocking)
   delay(10);
 }

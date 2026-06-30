@@ -10,6 +10,7 @@ idf_component_register(
         "config_sync.c"
         "ota_uart.c"
         "udp_listener.c"
+        "led.c"
     INCLUDE_DIRS "."
     REQUIRES
         openthread
@@ -17,6 +18,7 @@ idf_component_register(
         esp_event
         nvs_flash
         driver
+        esp_timer
         mbedtls
         app_update
 )

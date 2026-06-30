@@ -13,6 +13,22 @@ the rack sensors.
   bus at pin `D4` (`ONE_WIRE_BUS`). A disconnected probe reports `err` instead
   of a value, so the slot count stays stable.
 
+## Status LEDs
+Three discrete (single-colour) LEDs give at-a-glance status without a serial
+monitor. Each is wired **active-HIGH**: `pin → resistor → LED → GND` (set
+`LED_ACTIVE_LOW 1` in the sketch for common-anode wiring). Default pins are XIAO
+ESP32-C6 pads `D1/D2/D3` — `D4` is reserved for the OneWire bus.
+
+| LED | Pin | Meaning |
+|---|---|---|
+| **Power** (green) | `D1` | Solid once the firmware is running. *(Can instead be wired straight to 3V3 — then drop `LED_PWR_PIN`.)* |
+| **Network** (blue) | `D2` | **Blinks** (~1.25 Hz) while joining/attaching → **solid** once attached to the mesh as a `CHILD` (i.e. reporting). |
+| **Fault** (red) | `D3` | **Solid** on a permanent join failure (e.g. PSKd mismatch, err 28); **brief blink** on a transient error (a DS18B20 `err` or a UDP send failure). |
+
+Reading them together: *green only, blue blinking* = looking for the mesh;
+*green + blue solid* = healthy and reporting; *red solid* = won't join, check the
+PSKd/commissioning; *red blip* = a probe dropped out or a send failed.
+
 ## What it does
 1. **Boot / identity** — formats NVS if needed and reads the factory **EUI-64**
    (`ESP_MAC_IEEE802154`) into `g_eui`. The EUI tags every payload so the

@@ -19,6 +19,7 @@
 #include "commissioner.h" // CRITICAL: This header must include your wrapper prototype
 #include "uart_rx.h"
 #include "udp_listener.h"
+#include "led.h"
 
 static const char *TAG = "MAIN";
 
@@ -33,7 +34,15 @@ static void on_thread_state_changed(void *arg, esp_event_base_t event_base,
 
     if (event_id == OPENTHREAD_EVENT_ROLE_CHANGED) {
         ESP_LOGW(TAG, "NETWORK ROLE CHANGED: %d", role);
-        
+
+        // Drive the System status LED off the mesh role (heartbeat vs leader).
+        switch (role) {
+            case OT_DEVICE_ROLE_LEADER: led_set_role(LED_ROLE_LEADER);       break;
+            case OT_DEVICE_ROLE_ROUTER:
+            case OT_DEVICE_ROLE_CHILD:  led_set_role(LED_ROLE_CHILD_ROUTER);  break;
+            default:                    led_set_role(LED_ROLE_DETACHED);      break;
+        }
+
         if (role == OT_DEVICE_ROLE_LEADER) {
             if (esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
                 // DEBUG: Print actual radio parameters
@@ -87,6 +96,9 @@ void app_main(void)
         ESP_LOGE(TAG, "Critical NVS Failure. Restarting...");
         esp_restart();
     }
+
+    // 2b. Status LEDs (Commissioner LED on GPIO21/D3, System LED on GPIO2/D2).
+    led_init();
 
     // 3. Event Loop
     if (esp_event_loop_create_default() != ESP_OK) {

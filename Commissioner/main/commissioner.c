@@ -1,5 +1,6 @@
 #include "commissioner.h"
 #include "joiner_manager.h"
+#include "led.h"
 #include "esp_log.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
@@ -42,6 +43,20 @@ static void commissioner_state_cb(otCommissionerState state, void *context)
 {
     ESP_LOGW(TAG, "COMMISSIONER STATE UPDATE: %s", commissioner_state_to_str(state));
 
+    // Drive the Commissioner LED off the authoritative commissioner state.
+    switch (state) {
+        case OT_COMMISSIONER_STATE_ACTIVE:
+            led_set_comm(LED_COMM_ACTIVE);
+            led_set_fault(0);                 // clear any prior start-failed fault
+            break;
+        case OT_COMMISSIONER_STATE_PETITION:
+            led_set_comm(LED_COMM_PETITIONING);
+            break;
+        default:
+            led_set_comm(LED_COMM_DISABLED);
+            break;
+    }
+
     if (state == OT_COMMISSIONER_STATE_ACTIVE) {
         ESP_LOGI(TAG, "Commissioner ACTIVE. Awaiting scanned EUI64 entries via 'add' command.");
 
@@ -52,6 +67,7 @@ static void commissioner_state_cb(otCommissionerState state, void *context)
             otError err = joiner_add_locked(s_pending_eui, s_pending_pskd, s_pending_timeout);
             if (err == OT_ERROR_NONE) {
                 printf("JOINER_ADDED %s\n", s_pending_eui);
+                led_signal_joiner_added();
                 ESP_LOGI(TAG, "Pending joiner %s applied after re-petition", s_pending_eui);
             } else {
                 printf("ERROR ADD_FAILED %d\n", err);
@@ -111,6 +127,7 @@ void commissioner_start(void)
         ESP_LOGI(TAG, "Commissioner Start: OK");
     } else {
         ESP_LOGE(TAG, "Commissioner Start: FAILED %d", err);
+        led_set_fault(2);   // fault code 2 = commissioner start failed
     }
 }
 
@@ -118,6 +135,7 @@ void commissioner_stop(void)
 {
     otInstance *instance = esp_openthread_get_instance();
     otCommissionerStop(instance);
+    led_set_comm(LED_COMM_DISABLED);
     ESP_LOGI(TAG, "Commissioner Stopped");
 }
 
@@ -140,6 +158,7 @@ bool commissioner_add_joiner(const char *eui64, const char *pskd, uint32_t timeo
 
         if (err == OT_ERROR_NONE) {
             printf("JOINER_ADDED %s\n", eui64);
+            led_signal_joiner_added();
         } else {
             printf("ERROR ADD_FAILED %d\n", err);
         }
@@ -166,6 +185,7 @@ bool commissioner_add_joiner(const char *eui64, const char *pskd, uint32_t timeo
 
     // Tell the Bridge/app we're recovering; JOINER_ADDED will follow shortly.
     printf("COMMISSIONER_REPETITIONING\n");
+    led_set_comm(LED_COMM_PETITIONING);
     fflush(stdout);
     return false;
 }

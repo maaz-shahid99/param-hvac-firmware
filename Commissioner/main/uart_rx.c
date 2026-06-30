@@ -18,6 +18,7 @@
 #include "joiner_manager.h"
 #include "config_sync.h"
 #include "ota_uart.h"
+#include "led.h"
 
 // Forward declaration for security check
 bool verify_command_signature(char *input_buffer, char **cmd_part);
@@ -102,6 +103,8 @@ static void process_command(char *raw_input) {
     // trusted-link command and is intentionally NOT on the signed `add` path.
     if (token && strcmp(token, "factory_reset") == 0) {
         free(cmd_copy);
+        led_signal_reset();                  // System LED: fast flutter while we wipe
+        vTaskDelay(pdMS_TO_TICKS(500));      // let the flutter show before reboot
         nvs_flash_erase();
         esp_restart();
         return;  // unreachable
