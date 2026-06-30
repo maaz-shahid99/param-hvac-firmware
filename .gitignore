@@ -1,0 +1,22 @@
+# --- Arduino / ESP build output ---
+build/
+*.bin
+*.elf
+*.map
+*.merged.bin
+*.partitions.bin
+
+# --- ESP-IDF (Commissioner) ---
+# sdkconfig is environment-specific; keep sdkconfig.defaults instead.
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# --- PlatformIO (if used) ---
+.pio/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

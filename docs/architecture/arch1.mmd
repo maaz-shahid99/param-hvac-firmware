@@ -1,0 +1,31 @@
+flowchart TB
+    subgraph SRC[Data Sources]
+        ERP[SAP / ERP - Primary Sales, Stock]
+        DB[(Operational SQL DB)]
+        XL[Excel / Flat Files - Targets, Schemes]
+        API[Distributor & Secondary Sales Feeds]
+    end
+    subgraph PREP[Data Preparation]
+        TP[Tableau Prep / ETL]
+        EXT[(Hyper Extracts / Live Connections)]
+    end
+    subgraph SRV[Tableau Server / Tableau Cloud]
+        ENG[Hyper In-Memory Engine]
+        DASH[Curated Dashboards & Worksheets]
+        PULSE[Tableau Pulse - GenAI add-on, Cloud only]
+    end
+    subgraph USERS[Consumption]
+        CRE[Creators - Analysts build dashboards]
+        EXP[Explorers - Limited authoring]
+        VIE[Viewers - Read-only, Web & Mobile]
+    end
+    ERP --> TP
+    DB --> TP
+    XL --> TP
+    API --> TP
+    TP --> EXT --> ENG
+    DB -. live .-> ENG
+    ENG --> DASH --> PULSE
+    DASH --> CRE
+    DASH --> EXP
+    DASH --> VIE

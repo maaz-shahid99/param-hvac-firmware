@@ -1,0 +1,32 @@
+flowchart TB
+    subgraph SRC[Data Sources]
+        PG[(Client PostgreSQL Datamart)]
+        XLSX[Excel Upload]
+    end
+    subgraph ING[Onboarding & Schema Layer]
+        LLM1[LLM Schema Inference - infers tables, types, descriptions]
+        META[(Schema & Mapping Metadata - only metadata stored on platform)]
+        TEST[Test Connection / Validate]
+    end
+    subgraph APP[AIBI Application Layer]
+        UI[Web App - Workspaces, Dashboards, Chat]
+        BFF[Application / API Backend]
+        GEN[LLM Engine - SQL + Chart Generation]
+    end
+    subgraph EXPER[User Experience]
+        KPI[KPI Charts & Dashboards - up to 12 charts each]
+        CHAT[Conversational Chat - General / Dashboard / KPI]
+        SHARE[Chat Sharing within Org]
+    end
+    subgraph GOV[Access & Identity]
+        SSO[SSO Login]
+        RBAC[Roles - Owner / Project Admin / Editor / Viewer]
+    end
+    XLSX --> LLM1 --> META
+    PG --> TEST --> META
+    META --> BFF
+    UI --> BFF --> GEN
+    GEN -- read-only SQL --> PG
+    BFF --> KPI
+    BFF --> CHAT --> SHARE
+    SSO --> RBAC --> UI

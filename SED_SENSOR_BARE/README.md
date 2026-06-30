@@ -58,7 +58,7 @@ Open `SED_SENSOR_BARE.ino` in the Arduino IDE (ESP32 core with OpenThread),
 select an **ESP32-C6/H2** board, and upload. Watch the serial monitor at
 115200 baud:
 - `[HW] EUI-64: …` — note this; it's the device's identity (and what its
-  commissioning QR encodes, see [`../QR codes/`](../QR%20codes/)).
+  commissioning QR encodes, see [`../QR codes/`](../qr-codes/)).
 - `[JOINER RADAR] …` — scanning for a commissioner.
 - `[UDP] Packet sent: EUI=…;t=…` — attached and reporting.
 
@@ -68,5 +68,5 @@ select an **ESP32-C6/H2** board, and upload. Watch the serial monitor at
 - [`../Commissioner/`](../Commissioner/) — the C6 that commissions joiners and
   receives these UDP readings.
 - [`../Bridge/`](../Bridge/) — the C3 that forwards readings to the display node.
-- [`../Discovery Server/`](../Discovery%20Server/) — ingests and visualizes them.
+- [`../Discovery Server/`](https://github.com/YOUR-ORG/hvac-server) — ingests and visualizes them.
 - [`../SED_SENSOR/`](../SED_SENSOR/) — MLX90640 thermal-camera experiments.

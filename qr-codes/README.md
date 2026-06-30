@@ -1,7 +1,7 @@
 # QR codes — commissioning labels for routers & sensors
 
 Per-device commissioning artifacts used by the **Thread Commissioner** app's
-"Scan QR" flow ([`../thread_commissioner/`](../thread_commissioner/)). Scanning a
+"Scan QR" flow ([`https://github.com/YOUR-ORG/hvac-mobile`](https://github.com/YOUR-ORG/hvac-mobile)). Scanning a
 code feeds the device's identity straight into the `add`/commission command, so
 an installer never has to type a 16-hex EUI-64 by hand.
 

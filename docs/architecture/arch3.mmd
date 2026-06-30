@@ -1,0 +1,38 @@
+flowchart TB
+    subgraph SRC[Source Systems]
+        ERP[ERP - Primary Sales, Distributor & Stock Master]
+        SAPI[Secondary Sales & Scheme Feeds]
+        DOCS[Product Catalogues, Policy & Compliance PDFs]
+    end
+    subgraph ETL[Ingestion & Storage - Cloud-Native]
+        ADF[Orchestrated ETL Pipelines - parallel, incremental]
+        BLOB[(Object Storage - Raw & Documents)]
+        BRONZE[(Bronze - immutable raw)]
+        GOLD[(Gold - Facts & Dimensions)]
+    end
+    subgraph INTEL[Intelligence Layer - Multi-Agent]
+        ROOT[Root Reasoning Agent - low-cost LLM]
+        DBT[DB Tool - dynamic read-only SQL]
+        WEB[Web Search Sub-Agent]
+        RAG[RAG over Documents - Vector Search]
+    end
+    subgraph SERVE[Serving]
+        FAST[Streaming API - SSE]
+        WEBAPP[Web Chat App]
+        ADMIN[Admin Dashboard & Analytics]
+    end
+    subgraph GOV[Identity & Governance]
+        SSO[Enterprise SSO]
+        SESS[(Session & Chat History)]
+    end
+    ERP --> ADF
+    SAPI --> ADF
+    DOCS --> BLOB --> RAG
+    ADF --> BRONZE --> GOLD
+    ROOT --> DBT --> GOLD
+    ROOT --> WEB
+    ROOT --> RAG
+    ROOT --> FAST --> WEBAPP
+    WEBAPP --> ADMIN
+    SSO --> WEBAPP
+    FAST --> SESS

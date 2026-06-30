@@ -111,6 +111,6 @@ live in `bme_sensor.h`, `rtc_ds1307.h`, `logger.h`. Watch serial @ 115200 for
 
 ## Related modules
 - [Commissioner](../Commissioner/) — the C6 Thread/OpenThread partner.
-- [thread_commissioner](../thread_commissioner/) — the Flutter control app.
-- [Discovery Server](../Discovery%20Server/) — discovery + display node.
+- [thread_commissioner](https://github.com/YOUR-ORG/hvac-mobile) — the Flutter control app.
+- [Discovery Server](https://github.com/YOUR-ORG/hvac-server) — discovery + display node.
 - [SED_SENSOR_BARE](../SED_SENSOR_BARE/) — the mesh sensor firmware.
