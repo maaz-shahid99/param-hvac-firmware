@@ -23,8 +23,8 @@ holds every ESP32/Arduino target; the rest of the system lives in sibling repos.
 - **Arduino targets:** open the `.ino` in Arduino IDE (ESP32 core), pick the C6/C3 board, upload, watch serial @ 115200.
 
 ## Sibling repos
-- App: https://github.com/YOUR-ORG/hvac-mobile
-- Backend: https://github.com/YOUR-ORG/hvac-server
-- Web: https://github.com/YOUR-ORG/hvac-web
+- App: https://github.com/maaz-shahid99/param-hvac-mobile
+- Backend: https://github.com/maaz-shahid99/param-hvac-server
+- Web: https://github.com/maaz-shahid99/param-hvac-web
 
 Architecture diagrams: [docs/architecture/](docs/architecture/). Security notes: [SECURITY.md](SECURITY.md).
