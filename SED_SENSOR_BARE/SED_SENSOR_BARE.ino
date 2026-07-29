@@ -49,6 +49,17 @@ char g_eui[17] = "0000000000000000";
 volatile bool g_joined = false;
 volatile bool g_failed = false;
 
+// --- Auto network-recovery timeouts ---------------------------------------
+// If we boot holding stored credentials but can't (re)attach to that network
+// within OLD_NET_TIMEOUT_MS, clear the Thread credentials and reboot so the
+// device drops into the joiner and hunts for a NEW network. If the joiner then
+// can't find a new network within NEW_NET_TIMEOUT_MS, reboot to keep searching.
+// Together this stops a unit from being stranded on a router that is gone.
+#define OLD_NET_TIMEOUT_MS  60000UL     // 60 s trying the stored / old network
+#define NEW_NET_TIMEOUT_MS  180000UL    // 180 s searching for a new network
+uint32_t g_attach_deadline = 0;   // ms deadline to attach to the stored network (0 = disarmed)
+uint32_t g_join_deadline   = 0;   // ms deadline for the joiner to find a network (0 = disarmed)
+
 // --- JOINER CALLBACK ---
 void otaJoinerCallback(otError aError, void *aContext) {
   Serial.printf("\n[JOINER] Callback received with error code: %d\n", aError);
@@ -84,6 +95,21 @@ static void start_joiner_locked(otInstance *inst) {
   } else {
     Serial.println("[JOINER] Joiner process started. Scanning...");
   }
+}
+
+// --- Forget the stored Thread network, then reboot to search for a new one ---
+// Erases only the OpenThread persistent info (the stored dataset), NOT the whole
+// NVS, so a factory-provisioned per-device PSKd ("factory"/"pskd") survives. On
+// the next boot otDatasetGetActive() fails -> the joiner runs -> new network.
+static void leaveNetworkAndReboot() {
+  if (esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+    otInstance *inst = esp_openthread_get_instance();
+    otThreadSetEnabled(inst, false);       // must be disabled before erasing
+    otInstanceErasePersistentInfo(inst);   // wipe the stored Thread dataset
+    esp_openthread_lock_release();
+  }
+  delay(200);
+  ESP.restart();                           // does not return
 }
 
 // --- STATUS LEDS (3 discrete) ----------------------------------------------
@@ -183,7 +209,7 @@ void setup() {
     Serial.println("[FATAL] Could not acquire OT lock in setup!");
     return;
   }
-r   otInstance *inst = esp_openthread_get_instance();
+  otInstance *inst = esp_openthread_get_instance();
 
   // 2. CHECK FOR EXISTING CREDENTIALS FIRST
   otOperationalDataset activeDataset;
@@ -196,6 +222,7 @@ r   otInstance *inst = esp_openthread_get_instance();
     otIp6SetEnabled(inst, true);
     otThreadSetEnabled(inst, true);
     g_joined = true;
+    g_attach_deadline = millis() + OLD_NET_TIMEOUT_MS;   // 60 s to (re)attach, else forget + search
 
   } else {
     Serial.println("[SYSTEM] No credentials found. Starting Joiner Process...");
@@ -214,7 +241,8 @@ r   otInstance *inst = esp_openthread_get_instance();
     otLinkSetChannel(inst, 15);
     otLinkSetSupportedChannelMask(inst, (1 << 15));
 
-    start_joiner_locked(inst); 
+    start_joiner_locked(inst);
+    g_join_deadline = millis() + NEW_NET_TIMEOUT_MS;     // 180 s to find a new network, else reboot
   }
 
   esp_openthread_lock_release();
@@ -223,6 +251,40 @@ r   otInstance *inst = esp_openthread_get_instance();
 
 // --- MAIN LOOP ---
 void loop() {
+  // --- 0. NETWORK-RECOVERY WATCHDOGS ---------------------------------------
+  // (a) Stored/old network: while we hold credentials but aren't attached, poll
+  //     the role so we notice (re)attachment. If we never attach within the
+  //     OLD_NET_TIMEOUT_MS window, forget the credentials and reboot to search
+  //     for a new network. The deadline disarms on first attach, so a later brief
+  //     dropout will NOT wipe a network we successfully joined.
+  if (g_joined && !g_child) {
+    static uint32_t attachPoll = 0;
+    if (millis() - attachPoll > 2000) {
+      attachPoll = millis();
+      if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
+        otInstance *inst = esp_openthread_get_instance();
+        if (otThreadGetDeviceRole(inst) == OT_DEVICE_ROLE_CHILD) {
+          g_child = true;
+          g_attach_deadline = 0;                 // attached -> disarm the watchdog
+        }
+        esp_openthread_lock_release();
+      }
+    }
+    if (g_attach_deadline && (int32_t)(millis() - g_attach_deadline) >= 0) {
+      Serial.println("[NET] Stored network not found in 60s. Clearing credentials + rebooting to search for a new network.");
+      leaveNetworkAndReboot();                   // does not return
+    }
+  }
+
+  // (b) Joiner: if no new network is found within NEW_NET_TIMEOUT_MS, reboot to
+  //     keep searching (credentials are already cleared, so we re-enter the joiner).
+  if (!g_joined && !g_failed && g_join_deadline &&
+      (int32_t)(millis() - g_join_deadline) >= 0) {
+    Serial.println("[NET] No new network found in 180s. Rebooting to keep searching.");
+    delay(200);
+    ESP.restart();
+  }
+
   // --- 1. JOINER RADAR & RETRY LOGIC ---
   if (!g_joined && !g_failed) {
     if (esp_openthread_lock_acquire(pdMS_TO_TICKS(100))) {
@@ -261,7 +323,9 @@ void loop() {
   static uint32_t last = 0;
   
   // We check the timer OUTSIDE the lock. 
-  if (g_joined && (millis() - last > 10000)) {
+  // Gate on g_child: only read sensors + TX once actually attached as a CHILD
+  // (avoids hammering the 1-Wire bus while still detached / searching).
+  if (g_child && (millis() - last > 10000)) {
     
     // 3a. Read Sensors (This blocks for ~750ms, so we do it BEFORE locking Thread)
     ds18b20.requestTemperatures();
