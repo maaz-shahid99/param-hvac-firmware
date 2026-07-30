@@ -68,5 +68,5 @@ select an **ESP32-C6/H2** board, and upload. Watch the serial monitor at
 - [`../Commissioner/`](../Commissioner/) — the C6 that commissions joiners and
   receives these UDP readings.
 - [`../Bridge/`](../Bridge/) — the C3 that forwards readings to the display node.
-- [`../Discovery Server/`](https://github.com/maaz-shahid99/param-hvac-server) — ingests and visualizes them.
+- [hvac-server](https://github.com/maaz-shahid99/param-hvac-server) — ingests and visualizes them.
 - [`../SED_SENSOR/`](../SED_SENSOR/) — MLX90640 thermal-camera experiments.

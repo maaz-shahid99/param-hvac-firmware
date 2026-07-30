@@ -33,9 +33,14 @@ commands tolerate the signature via `stripTrailingSig()`.
 
 ### 3. Provisioning, Wi-Fi scan & credential replication
 - `PROVISION|{ssid,pass,zone,netName,disc,cloud,cloudKey,wauth,euser,eid}` ->
-  stores creds, switches AP cleanly. Optional `disc` overrides the
-  discovery-server URL; optional `cloud`/`cloudKey` set the AWS alerting service
-  base URL + per-site API key (persisted in NVS).
+  stores creds, switches AP cleanly. Optional `cloud`/`cloudKey` set the alerting
+  service base URL + per-site API key (persisted in NVS).
+- **Discovery needs no field of its own.** Discovery is served by the cloud server
+  at `<cloud>/discovery`, so `deriveDiscoveryUrl()` computes it from `cloud` and
+  persists it — send `disc` **only** to override it for a site running the
+  standalone `discovery-server` on its own port. Units provisioned before this
+  change (a saved `cloud` but no `disc`) derive it at boot instead. With no cloud
+  URL at all, discovery is simply skipped rather than retried against a default.
 - **WPA2-Enterprise (PEAP/MSCHAPv2):** set `wauth="peap"` with `euser` (username)
   and optional `eid` (outer identity); `wifiBeginAuto()` uses `WPA2_AUTH_PEAP`,
   else falls back to WPA2-PSK. All three persist in NVS.
@@ -92,7 +97,7 @@ Run from `loop()` so UART has a single reader during transfers:
 | Command | Signed | Effect / reply |
 |---|---|---|
 | `STATUS?` / `AUTH|<pin>` / `SETPIN|<old>|<new>` | -- | auth handshake |
-| `PROVISION|{...}` | no | Wi-Fi (PSK or PEAP) + discovery/cloud setup |
+| `PROVISION|{...}` | no | Wi-Fi (PSK or PEAP) + cloud setup (discovery is derived) |
 | `SCAN?` | no | `WIFI|<ssid>:<rssi>:<enc>,…` live network list |
 | `SYS?` | no | `SYS|role=...` status line |
 | `NODES?` | no | `NODES_BEGIN` / `NODE|<eui>` / `NODES_END` |
@@ -112,5 +117,6 @@ live in `bme_sensor.h`, `rtc_ds1307.h`, `logger.h`. Watch serial @ 115200 for
 ## Related modules
 - [Commissioner](../Commissioner/) — the C6 Thread/OpenThread partner.
 - [thread_commissioner](https://github.com/maaz-shahid99/param-hvac-mobile) — the Flutter control app.
-- [Discovery Server](https://github.com/maaz-shahid99/param-hvac-server) — discovery + display node.
+- [hvac-server](https://github.com/maaz-shahid99/param-hvac-server) — the cloud server
+  (ingest, alerts, OTA, and discovery at `/discovery`) + the optional display node.
 - [SED_SENSOR_BARE](../SED_SENSOR_BARE/) — the mesh sensor firmware.
