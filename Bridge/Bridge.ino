@@ -143,12 +143,23 @@ static void forwardEnvCloud(const String &eui, const String &csv);
 static void forwardCrashCloud(const String &eui, const String &payload);
 
 // --- Discovery / data-forwarding to the display node ---
-// The cloud discovery server address is fixed infrastructure baked into the
-// firmware (same for every unit, so it survives gateway failover). It can be
-// overridden per-site by a "disc" field in the PROVISION payload (stored NVS).
-#define DEFAULT_DISCOVERY_URL "http://10.14.98.109:8000"   // <-- set to your discovery server
+// The discovery service is now merged onto the cloud server at "<cloud>/discovery",
+// so by default we derive it from g_cloudUrl (see deriveDiscoveryUrl()) rather than
+// pointing at separate infrastructure — one URL to provision. A site running a
+// standalone discovery server can still override this with a "disc" field in the
+// PROVISION payload (stored NVS); an explicit override always wins over derivation.
+#define DEFAULT_DISCOVERY_URL ""
 static String   g_discoveryUrl = DEFAULT_DISCOVERY_URL;
 static String   g_nodeUrl      = "";                        // discovered display node e.g. http://192.168.1.60:8001
+
+// Derive the merged discovery URL from the cloud URL ("<cloud>/discovery"). Used
+// whenever a site hasn't explicitly provisioned a standalone "disc" override.
+static String deriveDiscoveryUrl(const String &cloud) {
+  if (cloud.isEmpty()) return "";
+  String base = cloud;
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+  return base + "/discovery";
+}
 
 // --- Cloud alerting service (AWS) ---
 // Readings are ALSO posted here (in addition to the LAN display node) so the
@@ -340,6 +351,10 @@ void handleProvisioning(const String &jsonPayload) {
   if (cloud && strlen(cloud) > 0) {
     preferences.putString("cloud", cloud);
     g_cloudUrl = cloud;
+    if (!disc || strlen(disc) == 0) {          // no explicit override -> derive + persist
+      g_discoveryUrl = deriveDiscoveryUrl(g_cloudUrl);
+      preferences.putString("disc", g_discoveryUrl);
+    }
   }
   if (cloudKey && strlen(cloudKey) > 0) {
     preferences.putString("cloudKey", cloudKey);
@@ -1965,6 +1980,12 @@ void setup() {
   if (savedDisc.length() > 0) g_discoveryUrl = savedDisc;
   if (savedCloud.length() > 0) g_cloudUrl = savedCloud;
   if (savedCloudKey.length() > 0) g_cloudKey = savedCloudKey;
+  // Back-compat: a device provisioned before discovery was merged onto the cloud
+  // server has "cloud" saved but no "disc" — derive it now instead of falling
+  // back to the old hardcoded dev IP (which no longer exists).
+  if (savedDisc.isEmpty() && savedCloud.length() > 0) {
+    g_discoveryUrl = deriveDiscoveryUrl(g_cloudUrl);
+  }
   Serial.printf("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
   Serial.printf("[BOOT] Cloud alerting: %s (key %s)\n",
                 g_cloudUrl.isEmpty() ? "(none)" : g_cloudUrl.c_str(),
