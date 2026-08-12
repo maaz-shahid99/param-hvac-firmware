@@ -257,6 +257,56 @@ volatile bool g_pendingScan  = false;   // SCAN? requested from the BLE task (ru
 // Feature 3: a panic report captured at boot from the core-dump partition,
 // "<reset>|<pc>|<bt>". Relayed to the C6 (which tags our EUI) once on-network.
 static String g_crashPayload = "";
+
+// --- Crash breadcrumbs (survive a panic reset) ------------------------------
+// 123 crash reports so far have told us "pc=0x420ec86e task=wifi" and nothing
+// else: `detail` was empty in every single one, and on RISC-V the core-dump
+// summary carries no backtrace array (that field is Xtensa-only). So we know
+// WHERE it died and nothing about how it got there.
+//
+// RTC_NOINIT memory is not cleared by a panic/SW reset (only by power-on), so a
+// short ring of breadcrumbs written before the fault is still readable on the
+// next boot. Kept deliberately small: the whole crash payload has to fit the
+// C6's 400-byte relay line, minus the "CRASH=<eui>;c=" prefix.
+#define BLOG_SZ     320
+#define BLOG_MAGIC  0x424C4F47u          // "BLOG"
+RTC_NOINIT_ATTR static char     g_blog[BLOG_SZ];
+RTC_NOINIT_ATTR static uint16_t g_blogLen;
+RTC_NOINIT_ATTR static uint32_t g_blogMagic;
+
+static void blogReset() {
+  g_blogLen = 0;
+  g_blog[0] = '\0';
+  g_blogMagic = BLOG_MAGIC;
+}
+
+// Append one breadcrumb. Always mirrors to Serial, so a bench session sees the
+// same trail as a crash report. Not ISR-safe; call from task context only.
+static void blog(const char *fmt, ...) {
+  char tmp[80];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  Serial.printf("[LOG] %s\n", tmp);
+
+  if (g_blogMagic != BLOG_MAGIC || g_blogLen >= BLOG_SZ) blogReset();
+  size_t want = strlen(tmp) + 1;                 // +1 for the ';' separator
+  if (want >= BLOG_SZ) return;
+  // Ring: drop from the FRONT until the new entry fits, so what survives is
+  // always the most recent activity before the fault.
+  while (g_blogLen + want >= BLOG_SZ) {
+    char *cut = (char *) memchr(g_blog, ';', g_blogLen);
+    size_t drop = cut ? (size_t)(cut - g_blog) + 1 : g_blogLen;
+    memmove(g_blog, g_blog + drop, g_blogLen - drop);
+    g_blogLen -= drop;
+  }
+  if (g_blogLen) g_blog[g_blogLen++] = ';';
+  memcpy(g_blog + g_blogLen, tmp, strlen(tmp));
+  g_blogLen += strlen(tmp);
+  g_blog[g_blogLen] = '\0';
+}
 static bool   g_crashSent    = false;
 static uint32_t g_lastCrashTry = 0;
 static uint8_t  g_crashTries   = 0;
@@ -367,6 +417,11 @@ void handleProvisioning(const String &jsonPayload) {
   Serial.printf("[WIFI] Connecting to %s...\n", SSID_LOG(ssid));
   bleNotifyLine("STATUS CONNECTING_WIFI");
 
+  // NOTE: this runs on the NimBLE host task (onWrite -> handleProvisioning).
+  // Wi-Fi and BLE share one radio on the C3, so reconfiguring the Wi-Fi driver
+  // from the BLE task is a genuine hazard; the breadcrumb makes it obvious in
+  // the next crash report if that is what we were doing.
+  blog("prov.wifi ble-task st=%d", (int)WiFi.status());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
@@ -437,10 +492,15 @@ static void applyWifi(const String &ssid, const String &pass) {
   String eid   = preferences.getString("eid", "");
   preferences.end();
   Serial.printf("[WIFI] (Re)connecting to %s [%s]...\n", SSID_LOG(ssid.c_str()), wauth.c_str());
+  // Breadcrumb either side of the teardown: 119 of 123 panics landed in
+  // task=wifi, so knowing whether we were mid-reassociate when it died is the
+  // single most useful thing the next crash report can carry.
+  blog("wifi.apply st=%d heap=%u", (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
   wifiBeginAuto(ssid, pass, wauth, euser, eid);
+  blog("wifi.begun");
 }
 
 // Scan nearby Wi-Fi APs and reply in one notification for the app's picker:
@@ -448,7 +508,9 @@ static void applyWifi(const String &ssid, const String &pass) {
 // Strongest-first, capped to the 256-byte MTU. Blocking — call only from loop().
 static void doWifiScan() {
   WiFi.mode(WIFI_STA);
+  blog("wifi.scan start");
   int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+  blog("wifi.scan n=%d", n);
   String out = "WIFI|";
   bool first = true;
   for (int i = 0; i < n; i++) {
@@ -521,6 +583,7 @@ static void handleGatewayRole(const String &role) {
       Serial.println("[GW] Now ACTIVE gateway (Leader).");
     }
     if (WiFi.status() != WL_CONNECTED) {
+      blog("gw.leader wifi-down -> reconnect");
       preferences.begin("gateway_config", true);
       String ssid = preferences.getString("ssid", "");
       String pass = preferences.getString("pass", "");
@@ -730,17 +793,25 @@ static void forwardEnvCloud(const String &eui, const String &csv) {
 }
 
 // --- Forward a firmware crash report to the cloud (Feature 3). Only the active
-// gateway runs this. `payload` is "<reset>|<pc>|<bt>". ---
+// gateway runs this. `payload` is "<reset>|<pc>|<bt>[|<detail>]".
+// The 4th field is optional: a router still running older firmware sends three,
+// and must keep working rather than having its report mangled. ---
 static void forwardCrashCloud(const String &eui, const String &payload) {
   if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
-  int p1 = payload.indexOf('|'), p2 = payload.indexOf('|', p1 + 1);
+  int p1 = payload.indexOf('|');
+  int p2 = (p1 >= 0) ? payload.indexOf('|', p1 + 1) : -1;
+  int p3 = (p2 >= 0) ? payload.indexOf('|', p2 + 1) : -1;
   String reset = p1 > 0 ? payload.substring(0, p1) : payload;
   String pc = (p1 >= 0 && p2 > p1) ? payload.substring(p1 + 1, p2) : "";
-  String bt = (p2 >= 0) ? payload.substring(p2 + 1) : "";
+  String bt = (p2 >= 0) ? (p3 > p2 ? payload.substring(p2 + 1, p3)
+                                   : payload.substring(p2 + 1)) : "";
+  String detail = (p3 >= 0) ? payload.substring(p3 + 1) : "";
+  detail.replace("\"", "'");      // keep the hand-built JSON below well-formed
+  bt.replace("\"", "'");
   const String url = g_cloudUrl + "/v1/crashes";
   const String body = String("{\"sensor_id\":\"") + eui + "\",\"reset_reason\":\"" + reset +
       "\",\"fw\":\"c3-v" + String(BRIDGE_FW_VERSION) + "\",\"pc\":\"" + pc +
-      "\",\"backtrace\":\"" + bt + "\"}";
+      "\",\"backtrace\":\"" + bt + "\",\"detail\":\"" + detail + "\"}";
   int code = 0;
   if (g_cloudUrl.startsWith("https://")) {
     WiFiClientSecure secure;
@@ -1912,7 +1983,7 @@ static void captureCrashAtBoot() {
   }
   Serial.printf("[BOOT] reset reason: %s\n", reason);
 
-  String pc = "", bt = "";
+  String pc = "", bt = "", detail = "";
   if (esp_core_dump_image_check() == ESP_OK) {
     esp_core_dump_summary_t *sum =
         (esp_core_dump_summary_t *) malloc(sizeof(esp_core_dump_summary_t));
@@ -1920,9 +1991,28 @@ static void captureCrashAtBoot() {
       char tmp[24];
       snprintf(tmp, sizeof(tmp), "0x%08x", (unsigned)sum->exc_pc);
       pc = tmp;
-      // RISC-V (C3) doesn't fill a backtrace array (that's Xtensa-only); the
-      // faulting PC + crashing task name is enough to addr2line the site.
+      // RISC-V (C3) doesn't fill a backtrace array (that's Xtensa-only), so the
+      // PC alone gave one frame and no reason. The summary DOES carry the
+      // exception registers, and we were discarding them:
+      //   mcause -> WHY it trapped (illegal instruction / load / store fault)
+      //   mtval  -> the faulting address
+      //   ra     -> the return address, i.e. the CALLER — a second frame
+      // That turns "it died somewhere in the wifi task" into an actual lead.
       bt = String("task=") + String(sum->exc_task);
+#if defined(__riscv)
+      char regs[96];
+      snprintf(regs, sizeof(regs), "mcause=0x%x mtval=0x%08x ra=0x%08x sp=0x%08x",
+               (unsigned)sum->ex_info.mcause, (unsigned)sum->ex_info.mtval,
+               (unsigned)sum->ex_info.ra, (unsigned)sum->ex_info.sp);
+      detail = regs;
+#endif
+      // First bytes of the app ELF hash: proves which build an address belongs
+      // to. Decoding a PC against the wrong ELF gives a confidently wrong answer.
+      char sha[12];
+      snprintf(sha, sizeof(sha), " elf=%02x%02x%02x%02x",
+               sum->app_elf_sha256[0], sum->app_elf_sha256[1],
+               sum->app_elf_sha256[2], sum->app_elf_sha256[3]);
+      detail += sha;
     }
     if (sum) free(sum);
     esp_core_dump_image_erase();   // report it once
@@ -1930,9 +2020,26 @@ static void captureCrashAtBoot() {
 
   bool isCrash = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                   rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT);
+
+  // Breadcrumbs from before the fault. Only meaningful across a reset that
+  // preserves RTC memory — a power-on cycle leaves this uninitialised, so the
+  // magic check is what stops us reporting garbage as a trail.
+  if (isCrash && g_blogMagic == BLOG_MAGIC && g_blogLen > 0) {
+    g_blog[g_blogLen < BLOG_SZ ? g_blogLen : BLOG_SZ - 1] = '\0';
+    detail += " trail=";
+    detail += g_blog;
+  }
+  blogReset();                      // fresh trail for this boot
+
+  // The C6 relays this in a 400-byte line ("CRASH=<16 hex>;c=" ~ 24 of them).
+  // Truncate here rather than letting snprintf silently cut it over there.
+  if (detail.length() > 300) detail = detail.substring(0, 300);
+  // '|' separates the payload fields, so it must not appear inside one.
+  detail.replace('|', '/');
+
   if (isCrash || pc.length() > 0) {
-    g_crashPayload = String(reason) + "|" + pc + "|" + bt;
-    Serial.printf("[CRASH] captured: %s pc=%s\n", reason, pc.c_str());
+    g_crashPayload = String(reason) + "|" + pc + "|" + bt + "|" + detail;
+    Serial.printf("[CRASH] captured: %s pc=%s %s\n", reason, pc.c_str(), detail.c_str());
   }
 }
 
