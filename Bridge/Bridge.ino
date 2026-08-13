@@ -33,8 +33,9 @@ static const char *CLOUD_ROOT_CA = "";
 #endif
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
-// c3_version from the manifest.
-#define BRIDGE_FW_VERSION 19
+// c3_version from the manifest. Publishing a build without bumping it means the
+// fleet politely refuses the update and reports itself up-to-date.
+#define BRIDGE_FW_VERSION 20
 
 // Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
 // commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
@@ -1080,6 +1081,21 @@ static void otaC3FromUrl(const String &url) {
   ESP.restart();
 }
 
+// Read the image filename for one chip out of a firmware manifest.
+//
+// Two spellings exist in the field: the old display node published "<kind>_file"
+// while the cloud server published "<kind>file". Reading only one of them is how
+// OTA came to fail silently for every build -- an absent key yields "", which the
+// callers below treat as "nothing to install", so the gateway announced itself
+// up-to-date while never downloading a thing. Accept either, and let the LOG say
+// which was found so the next mismatch is visible instead of mute.
+static String manifestFile(JsonDocument &doc, const char *kind) {
+  const char *v = doc[String(kind) + "_file"] | "";
+  if (v && *v) return String(v);
+  v = doc[String(kind) + "file"] | "";
+  return String(v ? v : "");
+}
+
 // Check the manifest on the display node and self-update if a newer C3 build
 // is published. (Phase 1: this unit only. Fleet rollout = Phase 3.)
 static void performOtaCheck() {
@@ -1098,13 +1114,14 @@ static void performOtaCheck() {
   if (err) { bleNotifyLine("ERR OTA MANIFEST_JSON"); return; }
 
   int c3ver = doc["c3_version"] | 0;
-  String c3file = doc["c3_file"] | "";
-  Serial.printf("[OTA] manifest c3_version=%d (running %d)\n", c3ver, BRIDGE_FW_VERSION);
+  String c3file = manifestFile(doc, "c3");
+  Serial.printf("[OTA] manifest c3_version=%d file='%s' (running %d)\n",
+                c3ver, c3file.c_str(), BRIDGE_FW_VERSION);
 
-  if (c3ver <= BRIDGE_FW_VERSION || c3file.isEmpty()) {
-    bleNotifyLine("OTA UP_TO_DATE");
-    return;
-  }
+  // A manifest that advertises a version but no filename is a SERVER fault, not
+  // an up-to-date fleet. Reporting it as up-to-date is what hid the key mismatch.
+  if (c3file.isEmpty()) { bleNotifyLine("ERR OTA NO_FILE v" + String(c3ver)); return; }
+  if (c3ver <= BRIDGE_FW_VERSION) { bleNotifyLine("OTA UP_TO_DATE"); return; }
 
   bleNotifyLine("OTA UPDATING v" + String(c3ver));
   otaC3FromUrl(g_nodeUrl + "/firmware/" + c3file);
@@ -1225,7 +1242,7 @@ static void performOtaC6() {
   String c6file;
   if (http.GET() == HTTP_CODE_OK) {
     DynamicJsonDocument doc(512);
-    if (!deserializeJson(doc, http.getString())) c6file = (const char *)(doc["c6_file"] | "");
+    if (!deserializeJson(doc, http.getString())) c6file = manifestFile(doc, "c6");
   }
   http.end();
   if (c6file.isEmpty()) { bleNotifyLine("ERR OTAC6 NO_FILE"); return; }
@@ -1258,10 +1275,17 @@ static void performFleetOta(const String &baseurl) {
   http.end();
   if (e) { Serial.println("[FLEETOTA] manifest json fail"); return; }
 
-  int c3ver = doc["c3_version"] | 0; String c3file = doc["c3_file"] | "";
-  int c6ver = doc["c6_version"] | 0; String c6file = doc["c6_file"] | "";
-  Serial.printf("[FLEETOTA] manifest c3=%d (run %d), c6=%d (run %d)\n",
-                c3ver, BRIDGE_FW_VERSION, c6ver, g_c6Version);
+  int c3ver = doc["c3_version"] | 0; String c3file = manifestFile(doc, "c3");
+  int c6ver = doc["c6_version"] | 0; String c6file = manifestFile(doc, "c6");
+  Serial.printf("[FLEETOTA] manifest c3=%d '%s' (run %d), c6=%d '%s' (run %d)\n",
+                c3ver, c3file.c_str(), BRIDGE_FW_VERSION,
+                c6ver, c6file.c_str(), g_c6Version);
+  // Say so out loud: a newer build we can't name is a broken manifest, and the
+  // "complete (or already up-to-date)" line below would otherwise bury it.
+  if (c3ver > BRIDGE_FW_VERSION && c3file.isEmpty())
+    Serial.println("[FLEETOTA] c3 update advertised but manifest names no file -- skipping");
+  if (c6ver > g_c6Version && c6file.isEmpty())
+    Serial.println("[FLEETOTA] c6 update advertised but manifest names no file -- skipping");
 
   // C6 first (it reboots independently; the C3 stays up to stream it).
   if (!c6file.isEmpty() && c6ver > g_c6Version) {
