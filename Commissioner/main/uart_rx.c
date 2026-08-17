@@ -110,6 +110,23 @@ static void process_command(char *raw_input) {
         return;  // unreachable
     }
 
+    // C3 -> C6: plain restart, NO wipe. Trusted-link command on the same footing
+    // as factory_reset: it arrives only over the local UART from the paired
+    // Bridge, which gates it behind the authenticated BLE session or an
+    // admin-authenticated restart relayed from the cloud.
+    //
+    // Distinct from factory_reset on purpose — that one erases NVS, so it can
+    // never be the answer to "the radio is wedged, restart it". Restarting the
+    // C6 drops the mesh for a few seconds and closes any open commissioning
+    // window; children re-attach on their own.
+    if (token && strcmp(token, "reboot") == 0) {
+        free(cmd_copy);
+        printf("REBOOTING\n");                // let the C3 log it before the UART dies
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+        return;  // unreachable
+    }
+
     // C3 -> C6: broadcast a fleet-OTA command (signed) over the mesh.
     // Format: "ota_broadcast <baseurl>"  e.g. "ota_broadcast http://10.14.98.109:8001"
     if (token && strcmp(token, "ota_broadcast") == 0) {

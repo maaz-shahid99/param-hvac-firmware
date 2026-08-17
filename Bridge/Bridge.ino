@@ -254,6 +254,10 @@ static void performFleetOta(const String &baseurl);
 // lines, reported to the app via SYS?.  0=unknown, 1=active, 2=disabled.
 int g_commState = 0;
 volatile bool g_pendingReset = false;   // FACTORY_RESET requested from the BLE task
+// Restart requested from the dashboard, collected on the 30s /v1/mesh post.
+// 0 = none, 1 = C3 only, 2 = C6 only, 3 = both. Executed from loop(), never
+// inline, so an HTTP call is never torn down mid-flight.
+volatile int g_pendingReboot = 0;
 volatile bool g_pendingScan  = false;   // SCAN? requested from the BLE task (run in loop)
 // Feature 3: a panic report captured at boot from the core-dump partition,
 // "<reset>|<pc>|<bt>". Relayed to the C6 (which tags our EUI) once on-network.
@@ -949,8 +953,28 @@ static void forwardMeshCloud() {
               + "\"heap_free\":" + String((uint32_t)ESP.getFreeHeap()) + ","
               + "\"role\":\"" + (isActiveGateway ? "LEADER" : "STANDBY") + "\"}";
   int code = http.POST(body);
+  // The response to THIS post is our only inbound channel: the cloud cannot
+  // reach us, so an admin's restart request parks server-side until we collect
+  // it here. Every 30 s, already authenticated, and the body was being thrown
+  // away — no new endpoint or poll needed.
+  String resp = (code == HTTP_CODE_OK) ? http.getString() : String();
   http.end();
   Serial.printf("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+
+  if (resp.length()) {
+    DynamicJsonDocument rdoc(256);
+    if (!deserializeJson(rdoc, resp)) {
+      String what = String((const char *)(rdoc["reboot"] | ""));
+      if (what.length()) {
+        // Queue it; rebooting inside an HTTP call would strand the socket and
+        // the WDT bracket in loop() expects to own restarts (see g_pendingReset).
+        if      (what == "c3")   g_pendingReboot = 1;
+        else if (what == "c6")   g_pendingReboot = 2;
+        else if (what == "both") g_pendingReboot = 3;
+        Serial.printf("[CLOUD] restart requested from dashboard: %s\n", what.c_str());
+      }
+    }
+  }
 }
 
 // --- Gateway: poll the cloud for a tiered firmware OTA job ------------------
@@ -2202,6 +2226,23 @@ void loop() {
   if (g_pendingReset) {
     g_pendingReset = false;
     doFactoryReset();   // does not return
+  }
+
+  // 0d2. Restart requested from the dashboard (collected on the /v1/mesh post).
+  //      C6 first: it reboots independently and we want the command on the wire
+  //      before our own restart tears the UART down. On "both" we never reach
+  //      the log line — safeReboot does not return.
+  if (g_pendingReboot) {
+    int what = g_pendingReboot;
+    g_pendingReboot = 0;
+    if (what == 2 || what == 3) {
+      Serial.println("[SYSTEM] Restarting C6 (dashboard request)...");
+      Serial1.println("reboot");
+      Serial1.flush();
+      delay(200);              // let the C6 read the line before we go
+    }
+    if (what == 1 || what == 3) safeReboot("dashboard restart request");
+    Serial.println("[SYSTEM] C6 restart sent; C3 staying up.");
   }
 
   // 0e. Wi-Fi scan requested over BLE (blocking) — run here, notify the result.
