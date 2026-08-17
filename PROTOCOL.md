@@ -39,11 +39,22 @@ Config-sync    : CFG|<ver>|<ssid>|<pass>|<zone>|<net>|<pin>|<hmac>
 | Customer | JWT (HS256) | `POST /v1/auth/{register,login,join,forgot}`; `GET /v1/current,/v1/thresholds,/v1/alerts,…` | app + web-dashboard |
 | Support | `X-Support-Token` | `/v1/support/*` + firmware publish (404 unless `SUPPORT_TOKEN` set) | field-console |
 
-## 4. Discovery + display node (LAN, optional on-prem path — `hvac-server/discovery-server`)
+## 4. Discovery + display node (LAN, optional on-prem path)
+The discovery service runs in **either** of two places — the endpoint paths are identical:
+
+| Deployment | Base | Notes |
+|---|---|---|
+| **Merged (default)** | `<cloud_url>/discovery` on **8002** | `cloud-server/discovery_routes.py`, mounted into the cloud app. One server + one URL to provision; the gateway derives this from the cloud URL. |
+| Standalone | **8000** | `discovery-server/discovery_server.py` as its own process. Set the gateway's `disc` override to use it. |
+
 | Service | Port | Endpoints |
 |---|---|---|
-| Discovery Server | **8000** | `/register/sensor`, `/register/forwarder`, `/discover`, `/data`, `/poll`, `/mobile/poll` |
+| Discovery (either deployment) | **8002** `/discovery/*` or **8000** `/*` | `/register/sensor`, `/register/forwarder`, `/discover`, `/data`, `/fetch`, `/poll`, `/mobile/poll`, `/status` |
 | Display node | **8001** | `/ingest`, `/poll` (serves the local 3D-mesh dashboard) |
+
+> These endpoints are **unauthenticated** (no API key), matching the standalone
+> service. On the merged deployment they ride the same port as the customer API —
+> keep 8002 LAN-only, or firewall `/discovery/*`, if the appliance is internet-facing.
 
 ## 5. Frontend → backend (`hvac-web`)
 - `web-dashboard` dev server **5173**, `field-console` dev server **5174**.

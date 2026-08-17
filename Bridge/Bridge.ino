@@ -33,8 +33,9 @@ static const char *CLOUD_ROOT_CA = "";
 #endif
 
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
-// c3_version from the manifest.
-#define BRIDGE_FW_VERSION 19
+// c3_version from the manifest. Publishing a build without bumping it means the
+// fleet politely refuses the update and reports itself up-to-date.
+#define BRIDGE_FW_VERSION 20
 
 // Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
 // commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
@@ -143,12 +144,23 @@ static void forwardEnvCloud(const String &eui, const String &csv);
 static void forwardCrashCloud(const String &eui, const String &payload);
 
 // --- Discovery / data-forwarding to the display node ---
-// The cloud discovery server address is fixed infrastructure baked into the
-// firmware (same for every unit, so it survives gateway failover). It can be
-// overridden per-site by a "disc" field in the PROVISION payload (stored NVS).
-#define DEFAULT_DISCOVERY_URL "http://10.14.98.109:8000"   // <-- set to your discovery server
+// The discovery service is now merged onto the cloud server at "<cloud>/discovery",
+// so by default we derive it from g_cloudUrl (see deriveDiscoveryUrl()) rather than
+// pointing at separate infrastructure — one URL to provision. A site running a
+// standalone discovery server can still override this with a "disc" field in the
+// PROVISION payload (stored NVS); an explicit override always wins over derivation.
+#define DEFAULT_DISCOVERY_URL ""
 static String   g_discoveryUrl = DEFAULT_DISCOVERY_URL;
 static String   g_nodeUrl      = "";                        // discovered display node e.g. http://192.168.1.60:8001
+
+// Derive the merged discovery URL from the cloud URL ("<cloud>/discovery"). Used
+// whenever a site hasn't explicitly provisioned a standalone "disc" override.
+static String deriveDiscoveryUrl(const String &cloud) {
+  if (cloud.isEmpty()) return "";
+  String base = cloud;
+  while (base.endsWith("/")) base.remove(base.length() - 1);
+  return base + "/discovery";
+}
 
 // --- Cloud alerting service (AWS) ---
 // Readings are ALSO posted here (in addition to the LAN display node) so the
@@ -242,10 +254,64 @@ static void performFleetOta(const String &baseurl);
 // lines, reported to the app via SYS?.  0=unknown, 1=active, 2=disabled.
 int g_commState = 0;
 volatile bool g_pendingReset = false;   // FACTORY_RESET requested from the BLE task
+// Restart requested from the dashboard, collected on the 30s /v1/mesh post.
+// 0 = none, 1 = C3 only, 2 = C6 only, 3 = both. Executed from loop(), never
+// inline, so an HTTP call is never torn down mid-flight.
+volatile int g_pendingReboot = 0;
 volatile bool g_pendingScan  = false;   // SCAN? requested from the BLE task (run in loop)
 // Feature 3: a panic report captured at boot from the core-dump partition,
 // "<reset>|<pc>|<bt>". Relayed to the C6 (which tags our EUI) once on-network.
 static String g_crashPayload = "";
+
+// --- Crash breadcrumbs (survive a panic reset) ------------------------------
+// 123 crash reports so far have told us "pc=0x420ec86e task=wifi" and nothing
+// else: `detail` was empty in every single one, and on RISC-V the core-dump
+// summary carries no backtrace array (that field is Xtensa-only). So we know
+// WHERE it died and nothing about how it got there.
+//
+// RTC_NOINIT memory is not cleared by a panic/SW reset (only by power-on), so a
+// short ring of breadcrumbs written before the fault is still readable on the
+// next boot. Kept deliberately small: the whole crash payload has to fit the
+// C6's 400-byte relay line, minus the "CRASH=<eui>;c=" prefix.
+#define BLOG_SZ     320
+#define BLOG_MAGIC  0x424C4F47u          // "BLOG"
+RTC_NOINIT_ATTR static char     g_blog[BLOG_SZ];
+RTC_NOINIT_ATTR static uint16_t g_blogLen;
+RTC_NOINIT_ATTR static uint32_t g_blogMagic;
+
+static void blogReset() {
+  g_blogLen = 0;
+  g_blog[0] = '\0';
+  g_blogMagic = BLOG_MAGIC;
+}
+
+// Append one breadcrumb. Always mirrors to Serial, so a bench session sees the
+// same trail as a crash report. Not ISR-safe; call from task context only.
+static void blog(const char *fmt, ...) {
+  char tmp[80];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  Serial.printf("[LOG] %s\n", tmp);
+
+  if (g_blogMagic != BLOG_MAGIC || g_blogLen >= BLOG_SZ) blogReset();
+  size_t want = strlen(tmp) + 1;                 // +1 for the ';' separator
+  if (want >= BLOG_SZ) return;
+  // Ring: drop from the FRONT until the new entry fits, so what survives is
+  // always the most recent activity before the fault.
+  while (g_blogLen + want >= BLOG_SZ) {
+    char *cut = (char *) memchr(g_blog, ';', g_blogLen);
+    size_t drop = cut ? (size_t)(cut - g_blog) + 1 : g_blogLen;
+    memmove(g_blog, g_blog + drop, g_blogLen - drop);
+    g_blogLen -= drop;
+  }
+  if (g_blogLen) g_blog[g_blogLen++] = ';';
+  memcpy(g_blog + g_blogLen, tmp, strlen(tmp));
+  g_blogLen += strlen(tmp);
+  g_blog[g_blogLen] = '\0';
+}
 static bool   g_crashSent    = false;
 static uint32_t g_lastCrashTry = 0;
 static uint8_t  g_crashTries   = 0;
@@ -340,6 +406,10 @@ void handleProvisioning(const String &jsonPayload) {
   if (cloud && strlen(cloud) > 0) {
     preferences.putString("cloud", cloud);
     g_cloudUrl = cloud;
+    if (!disc || strlen(disc) == 0) {          // no explicit override -> derive + persist
+      g_discoveryUrl = deriveDiscoveryUrl(g_cloudUrl);
+      preferences.putString("disc", g_discoveryUrl);
+    }
   }
   if (cloudKey && strlen(cloudKey) > 0) {
     preferences.putString("cloudKey", cloudKey);
@@ -352,6 +422,11 @@ void handleProvisioning(const String &jsonPayload) {
   Serial.printf("[WIFI] Connecting to %s...\n", SSID_LOG(ssid));
   bleNotifyLine("STATUS CONNECTING_WIFI");
 
+  // NOTE: this runs on the NimBLE host task (onWrite -> handleProvisioning).
+  // Wi-Fi and BLE share one radio on the C3, so reconfiguring the Wi-Fi driver
+  // from the BLE task is a genuine hazard; the breadcrumb makes it obvious in
+  // the next crash report if that is what we were doing.
+  blog("prov.wifi ble-task st=%d", (int)WiFi.status());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
@@ -422,10 +497,15 @@ static void applyWifi(const String &ssid, const String &pass) {
   String eid   = preferences.getString("eid", "");
   preferences.end();
   Serial.printf("[WIFI] (Re)connecting to %s [%s]...\n", SSID_LOG(ssid.c_str()), wauth.c_str());
+  // Breadcrumb either side of the teardown: 119 of 123 panics landed in
+  // task=wifi, so knowing whether we were mid-reassociate when it died is the
+  // single most useful thing the next crash report can carry.
+  blog("wifi.apply st=%d heap=%u", (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
   wifiBeginAuto(ssid, pass, wauth, euser, eid);
+  blog("wifi.begun");
 }
 
 // Scan nearby Wi-Fi APs and reply in one notification for the app's picker:
@@ -433,7 +513,9 @@ static void applyWifi(const String &ssid, const String &pass) {
 // Strongest-first, capped to the 256-byte MTU. Blocking — call only from loop().
 static void doWifiScan() {
   WiFi.mode(WIFI_STA);
+  blog("wifi.scan start");
   int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+  blog("wifi.scan n=%d", n);
   String out = "WIFI|";
   bool first = true;
   for (int i = 0; i < n; i++) {
@@ -506,6 +588,7 @@ static void handleGatewayRole(const String &role) {
       Serial.println("[GW] Now ACTIVE gateway (Leader).");
     }
     if (WiFi.status() != WL_CONNECTED) {
+      blog("gw.leader wifi-down -> reconnect");
       preferences.begin("gateway_config", true);
       String ssid = preferences.getString("ssid", "");
       String pass = preferences.getString("pass", "");
@@ -715,17 +798,25 @@ static void forwardEnvCloud(const String &eui, const String &csv) {
 }
 
 // --- Forward a firmware crash report to the cloud (Feature 3). Only the active
-// gateway runs this. `payload` is "<reset>|<pc>|<bt>". ---
+// gateway runs this. `payload` is "<reset>|<pc>|<bt>[|<detail>]".
+// The 4th field is optional: a router still running older firmware sends three,
+// and must keep working rather than having its report mangled. ---
 static void forwardCrashCloud(const String &eui, const String &payload) {
   if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
-  int p1 = payload.indexOf('|'), p2 = payload.indexOf('|', p1 + 1);
+  int p1 = payload.indexOf('|');
+  int p2 = (p1 >= 0) ? payload.indexOf('|', p1 + 1) : -1;
+  int p3 = (p2 >= 0) ? payload.indexOf('|', p2 + 1) : -1;
   String reset = p1 > 0 ? payload.substring(0, p1) : payload;
   String pc = (p1 >= 0 && p2 > p1) ? payload.substring(p1 + 1, p2) : "";
-  String bt = (p2 >= 0) ? payload.substring(p2 + 1) : "";
+  String bt = (p2 >= 0) ? (p3 > p2 ? payload.substring(p2 + 1, p3)
+                                   : payload.substring(p2 + 1)) : "";
+  String detail = (p3 >= 0) ? payload.substring(p3 + 1) : "";
+  detail.replace("\"", "'");      // keep the hand-built JSON below well-formed
+  bt.replace("\"", "'");
   const String url = g_cloudUrl + "/v1/crashes";
   const String body = String("{\"sensor_id\":\"") + eui + "\",\"reset_reason\":\"" + reset +
       "\",\"fw\":\"c3-v" + String(BRIDGE_FW_VERSION) + "\",\"pc\":\"" + pc +
-      "\",\"backtrace\":\"" + bt + "\"}";
+      "\",\"backtrace\":\"" + bt + "\",\"detail\":\"" + detail + "\"}";
   int code = 0;
   if (g_cloudUrl.startsWith("https://")) {
     WiFiClientSecure secure;
@@ -862,8 +953,28 @@ static void forwardMeshCloud() {
               + "\"heap_free\":" + String((uint32_t)ESP.getFreeHeap()) + ","
               + "\"role\":\"" + (isActiveGateway ? "LEADER" : "STANDBY") + "\"}";
   int code = http.POST(body);
+  // The response to THIS post is our only inbound channel: the cloud cannot
+  // reach us, so an admin's restart request parks server-side until we collect
+  // it here. Every 30 s, already authenticated, and the body was being thrown
+  // away — no new endpoint or poll needed.
+  String resp = (code == HTTP_CODE_OK) ? http.getString() : String();
   http.end();
   Serial.printf("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+
+  if (resp.length()) {
+    DynamicJsonDocument rdoc(256);
+    if (!deserializeJson(rdoc, resp)) {
+      String what = String((const char *)(rdoc["reboot"] | ""));
+      if (what.length()) {
+        // Queue it; rebooting inside an HTTP call would strand the socket and
+        // the WDT bracket in loop() expects to own restarts (see g_pendingReset).
+        if      (what == "c3")   g_pendingReboot = 1;
+        else if (what == "c6")   g_pendingReboot = 2;
+        else if (what == "both") g_pendingReboot = 3;
+        Serial.printf("[CLOUD] restart requested from dashboard: %s\n", what.c_str());
+      }
+    }
+  }
 }
 
 // --- Gateway: poll the cloud for a tiered firmware OTA job ------------------
@@ -994,6 +1105,21 @@ static void otaC3FromUrl(const String &url) {
   ESP.restart();
 }
 
+// Read the image filename for one chip out of a firmware manifest.
+//
+// Two spellings exist in the field: the old display node published "<kind>_file"
+// while the cloud server published "<kind>file". Reading only one of them is how
+// OTA came to fail silently for every build -- an absent key yields "", which the
+// callers below treat as "nothing to install", so the gateway announced itself
+// up-to-date while never downloading a thing. Accept either, and let the LOG say
+// which was found so the next mismatch is visible instead of mute.
+static String manifestFile(JsonDocument &doc, const char *kind) {
+  const char *v = doc[String(kind) + "_file"] | "";
+  if (v && *v) return String(v);
+  v = doc[String(kind) + "file"] | "";
+  return String(v ? v : "");
+}
+
 // Check the manifest on the display node and self-update if a newer C3 build
 // is published. (Phase 1: this unit only. Fleet rollout = Phase 3.)
 static void performOtaCheck() {
@@ -1012,13 +1138,14 @@ static void performOtaCheck() {
   if (err) { bleNotifyLine("ERR OTA MANIFEST_JSON"); return; }
 
   int c3ver = doc["c3_version"] | 0;
-  String c3file = doc["c3_file"] | "";
-  Serial.printf("[OTA] manifest c3_version=%d (running %d)\n", c3ver, BRIDGE_FW_VERSION);
+  String c3file = manifestFile(doc, "c3");
+  Serial.printf("[OTA] manifest c3_version=%d file='%s' (running %d)\n",
+                c3ver, c3file.c_str(), BRIDGE_FW_VERSION);
 
-  if (c3ver <= BRIDGE_FW_VERSION || c3file.isEmpty()) {
-    bleNotifyLine("OTA UP_TO_DATE");
-    return;
-  }
+  // A manifest that advertises a version but no filename is a SERVER fault, not
+  // an up-to-date fleet. Reporting it as up-to-date is what hid the key mismatch.
+  if (c3file.isEmpty()) { bleNotifyLine("ERR OTA NO_FILE v" + String(c3ver)); return; }
+  if (c3ver <= BRIDGE_FW_VERSION) { bleNotifyLine("OTA UP_TO_DATE"); return; }
 
   bleNotifyLine("OTA UPDATING v" + String(c3ver));
   otaC3FromUrl(g_nodeUrl + "/firmware/" + c3file);
@@ -1139,7 +1266,7 @@ static void performOtaC6() {
   String c6file;
   if (http.GET() == HTTP_CODE_OK) {
     DynamicJsonDocument doc(512);
-    if (!deserializeJson(doc, http.getString())) c6file = (const char *)(doc["c6_file"] | "");
+    if (!deserializeJson(doc, http.getString())) c6file = manifestFile(doc, "c6");
   }
   http.end();
   if (c6file.isEmpty()) { bleNotifyLine("ERR OTAC6 NO_FILE"); return; }
@@ -1172,10 +1299,17 @@ static void performFleetOta(const String &baseurl) {
   http.end();
   if (e) { Serial.println("[FLEETOTA] manifest json fail"); return; }
 
-  int c3ver = doc["c3_version"] | 0; String c3file = doc["c3_file"] | "";
-  int c6ver = doc["c6_version"] | 0; String c6file = doc["c6_file"] | "";
-  Serial.printf("[FLEETOTA] manifest c3=%d (run %d), c6=%d (run %d)\n",
-                c3ver, BRIDGE_FW_VERSION, c6ver, g_c6Version);
+  int c3ver = doc["c3_version"] | 0; String c3file = manifestFile(doc, "c3");
+  int c6ver = doc["c6_version"] | 0; String c6file = manifestFile(doc, "c6");
+  Serial.printf("[FLEETOTA] manifest c3=%d '%s' (run %d), c6=%d '%s' (run %d)\n",
+                c3ver, c3file.c_str(), BRIDGE_FW_VERSION,
+                c6ver, c6file.c_str(), g_c6Version);
+  // Say so out loud: a newer build we can't name is a broken manifest, and the
+  // "complete (or already up-to-date)" line below would otherwise bury it.
+  if (c3ver > BRIDGE_FW_VERSION && c3file.isEmpty())
+    Serial.println("[FLEETOTA] c3 update advertised but manifest names no file -- skipping");
+  if (c6ver > g_c6Version && c6file.isEmpty())
+    Serial.println("[FLEETOTA] c6 update advertised but manifest names no file -- skipping");
 
   // C6 first (it reboots independently; the C3 stays up to stream it).
   if (!c6file.isEmpty() && c6ver > g_c6Version) {
@@ -1897,7 +2031,7 @@ static void captureCrashAtBoot() {
   }
   Serial.printf("[BOOT] reset reason: %s\n", reason);
 
-  String pc = "", bt = "";
+  String pc = "", bt = "", detail = "";
   if (esp_core_dump_image_check() == ESP_OK) {
     esp_core_dump_summary_t *sum =
         (esp_core_dump_summary_t *) malloc(sizeof(esp_core_dump_summary_t));
@@ -1905,9 +2039,28 @@ static void captureCrashAtBoot() {
       char tmp[24];
       snprintf(tmp, sizeof(tmp), "0x%08x", (unsigned)sum->exc_pc);
       pc = tmp;
-      // RISC-V (C3) doesn't fill a backtrace array (that's Xtensa-only); the
-      // faulting PC + crashing task name is enough to addr2line the site.
+      // RISC-V (C3) doesn't fill a backtrace array (that's Xtensa-only), so the
+      // PC alone gave one frame and no reason. The summary DOES carry the
+      // exception registers, and we were discarding them:
+      //   mcause -> WHY it trapped (illegal instruction / load / store fault)
+      //   mtval  -> the faulting address
+      //   ra     -> the return address, i.e. the CALLER — a second frame
+      // That turns "it died somewhere in the wifi task" into an actual lead.
       bt = String("task=") + String(sum->exc_task);
+#if defined(__riscv)
+      char regs[96];
+      snprintf(regs, sizeof(regs), "mcause=0x%x mtval=0x%08x ra=0x%08x sp=0x%08x",
+               (unsigned)sum->ex_info.mcause, (unsigned)sum->ex_info.mtval,
+               (unsigned)sum->ex_info.ra, (unsigned)sum->ex_info.sp);
+      detail = regs;
+#endif
+      // First bytes of the app ELF hash: proves which build an address belongs
+      // to. Decoding a PC against the wrong ELF gives a confidently wrong answer.
+      char sha[12];
+      snprintf(sha, sizeof(sha), " elf=%02x%02x%02x%02x",
+               sum->app_elf_sha256[0], sum->app_elf_sha256[1],
+               sum->app_elf_sha256[2], sum->app_elf_sha256[3]);
+      detail += sha;
     }
     if (sum) free(sum);
     esp_core_dump_image_erase();   // report it once
@@ -1915,9 +2068,26 @@ static void captureCrashAtBoot() {
 
   bool isCrash = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                   rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT);
+
+  // Breadcrumbs from before the fault. Only meaningful across a reset that
+  // preserves RTC memory — a power-on cycle leaves this uninitialised, so the
+  // magic check is what stops us reporting garbage as a trail.
+  if (isCrash && g_blogMagic == BLOG_MAGIC && g_blogLen > 0) {
+    g_blog[g_blogLen < BLOG_SZ ? g_blogLen : BLOG_SZ - 1] = '\0';
+    detail += " trail=";
+    detail += g_blog;
+  }
+  blogReset();                      // fresh trail for this boot
+
+  // The C6 relays this in a 400-byte line ("CRASH=<16 hex>;c=" ~ 24 of them).
+  // Truncate here rather than letting snprintf silently cut it over there.
+  if (detail.length() > 300) detail = detail.substring(0, 300);
+  // '|' separates the payload fields, so it must not appear inside one.
+  detail.replace('|', '/');
+
   if (isCrash || pc.length() > 0) {
-    g_crashPayload = String(reason) + "|" + pc + "|" + bt;
-    Serial.printf("[CRASH] captured: %s pc=%s\n", reason, pc.c_str());
+    g_crashPayload = String(reason) + "|" + pc + "|" + bt + "|" + detail;
+    Serial.printf("[CRASH] captured: %s pc=%s %s\n", reason, pc.c_str(), detail.c_str());
   }
 }
 
@@ -1965,6 +2135,12 @@ void setup() {
   if (savedDisc.length() > 0) g_discoveryUrl = savedDisc;
   if (savedCloud.length() > 0) g_cloudUrl = savedCloud;
   if (savedCloudKey.length() > 0) g_cloudKey = savedCloudKey;
+  // Back-compat: a device provisioned before discovery was merged onto the cloud
+  // server has "cloud" saved but no "disc" — derive it now instead of falling
+  // back to the old hardcoded dev IP (which no longer exists).
+  if (savedDisc.isEmpty() && savedCloud.length() > 0) {
+    g_discoveryUrl = deriveDiscoveryUrl(g_cloudUrl);
+  }
   Serial.printf("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
   Serial.printf("[BOOT] Cloud alerting: %s (key %s)\n",
                 g_cloudUrl.isEmpty() ? "(none)" : g_cloudUrl.c_str(),
@@ -2050,6 +2226,23 @@ void loop() {
   if (g_pendingReset) {
     g_pendingReset = false;
     doFactoryReset();   // does not return
+  }
+
+  // 0d2. Restart requested from the dashboard (collected on the /v1/mesh post).
+  //      C6 first: it reboots independently and we want the command on the wire
+  //      before our own restart tears the UART down. On "both" we never reach
+  //      the log line — safeReboot does not return.
+  if (g_pendingReboot) {
+    int what = g_pendingReboot;
+    g_pendingReboot = 0;
+    if (what == 2 || what == 3) {
+      Serial.println("[SYSTEM] Restarting C6 (dashboard request)...");
+      Serial1.println("reboot");
+      Serial1.flush();
+      delay(200);              // let the C6 read the line before we go
+    }
+    if (what == 1 || what == 3) safeReboot("dashboard restart request");
+    Serial.println("[SYSTEM] C6 restart sent; C3 staying up.");
   }
 
   // 0e. Wi-Fi scan requested over BLE (blocking) — run here, notify the result.

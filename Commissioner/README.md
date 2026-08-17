@@ -101,4 +101,4 @@ repo so the build config is reproducible.
 - [Bridge](../Bridge/) — the C3 uplink/BLE partner.
 - [thread_commissioner](https://github.com/maaz-shahid99/param-hvac-mobile) — the Flutter control app.
 - [SED_SENSOR_BARE](../SED_SENSOR_BARE/) — the sleepy-end-device sensors it commissions.
-- [Discovery Server](https://github.com/maaz-shahid99/param-hvac-server) — where readings end up.
+- [hvac-server](https://github.com/maaz-shahid99/param-hvac-server) — the cloud server where readings end up.

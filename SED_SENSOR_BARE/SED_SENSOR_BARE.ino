@@ -50,15 +50,51 @@ volatile bool g_joined = false;
 volatile bool g_failed = false;
 
 // --- Auto network-recovery timeouts ---------------------------------------
-// If we boot holding stored credentials but can't (re)attach to that network
-// within OLD_NET_TIMEOUT_MS, clear the Thread credentials and reboot so the
-// device drops into the joiner and hunts for a NEW network. If the joiner then
-// can't find a new network within NEW_NET_TIMEOUT_MS, reboot to keep searching.
+// If we boot holding stored credentials but can't (re)attach, we eventually
+// clear them and drop into the joiner to hunt for a NEW network. If the joiner
+// then can't find one within NEW_NET_TIMEOUT_MS, reboot to keep searching.
 // Together this stops a unit from being stranded on a router that is gone.
-#define OLD_NET_TIMEOUT_MS  60000UL     // 60 s trying the stored / old network
+//
+// The erase is deliberately NOT on the first failure. Erasing is destructive:
+// once the dataset is gone the device can only rejoin through a commissioner
+// window, which means a person with the QR label. A single slow attach — the
+// parent rebooting, a marginal link, RF congestion — must not cost a site
+// visit. So a failed attach now costs a REBOOT AND RETRY with the same
+// credentials, and only NET_FAIL_LIMIT consecutive failures erase them.
+//
+// This is not hypothetical: this mesh has exactly one router (the gateway) and
+// it panics every few hours. With a 60 s single-shot timeout, any sensor that
+// happened to reboot during a gateway outage wiped its own credentials and sat
+// in the joiner forever, showing "error 23" (OT_ERROR_NOT_FOUND — no network is
+// accepting joiners) because no commissioning window was open.
+#define OLD_NET_TIMEOUT_MS  300000UL    // 5 min per attempt on the stored network
 #define NEW_NET_TIMEOUT_MS  180000UL    // 180 s searching for a new network
+#define NET_FAIL_LIMIT      5           // consecutive failed attempts before erasing
+// Sleepy data-poll period. Must stay well under the parent's child timeout
+// (240 s by default) or the parent ages this child out of its table.
+#define SED_POLL_PERIOD_MS  3000UL
 uint32_t g_attach_deadline = 0;   // ms deadline to attach to the stored network (0 = disarmed)
 uint32_t g_join_deadline   = 0;   // ms deadline for the joiner to find a network (0 = disarmed)
+
+// Consecutive failed-attach count, in NVS so it survives the reboot between
+// attempts. Kept in its own namespace so it is untouched by the OpenThread
+// dataset erase and by the "factory"/pskd provisioning.
+static uint8_t netfail_get() {
+  nvs_handle_t h; uint8_t v = 0;
+  if (nvs_open("netstate", NVS_READONLY, &h) == ESP_OK) {
+    nvs_get_u8(h, "failn", &v);          // leaves v=0 if the key is absent
+    nvs_close(h);
+  }
+  return v;
+}
+static void netfail_set(uint8_t v) {
+  nvs_handle_t h;
+  if (nvs_open("netstate", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_u8(h, "failn", v);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
 
 // --- JOINER CALLBACK ---
 void otaJoinerCallback(otError aError, void *aContext) {
@@ -219,10 +255,27 @@ void setup() {
     otLinkModeConfig linkMode = { .mRxOnWhenIdle = 0, .mDeviceType = 0, .mNetworkData = 1 };
     otThreadSetLinkMode(inst, linkMode);
 
+    // Point the scan at the channel this dataset actually uses. The joiner
+    // branch below pins the mask to channel 15; that setting can survive into
+    // this path, so a network on any other channel would be masked out and the
+    // attach could never succeed. Deriving it from the dataset keeps the two
+    // boot paths consistent instead of dependent on what the last one left set.
+    if (activeDataset.mComponents.mIsChannelPresent) {
+      otLinkSetSupportedChannelMask(inst, (uint32_t)1 << activeDataset.mChannel);
+      Serial.printf("[SYSTEM] Dataset channel %u.\n", activeDataset.mChannel);
+    }
+
     otIp6SetEnabled(inst, true);
     otThreadSetEnabled(inst, true);
+
+    // Be explicit about the sleepy poll period. We join with the radio on
+    // (mRxOnWhenIdle=1) but run sleepy (=0), so the link the device attaches on
+    // is not the one it joined on; pinning the poll makes that transition
+    // deterministic rather than dependent on the stack's derived default.
+    otLinkSetPollPeriod(inst, SED_POLL_PERIOD_MS);
+
     g_joined = true;
-    g_attach_deadline = millis() + OLD_NET_TIMEOUT_MS;   // 60 s to (re)attach, else forget + search
+    g_attach_deadline = millis() + OLD_NET_TIMEOUT_MS;   // per-attempt window; see NET_FAIL_LIMIT
 
   } else {
     Serial.println("[SYSTEM] No credentials found. Starting Joiner Process...");
@@ -266,12 +319,36 @@ void loop() {
         if (otThreadGetDeviceRole(inst) == OT_DEVICE_ROLE_CHILD) {
           g_child = true;
           g_attach_deadline = 0;                 // attached -> disarm the watchdog
+          // Success was silent: the log went quiet after "Connecting..." whether
+          // the device had attached or was still trying, so the only way to tell
+          // them apart was to wait out the timeout. Say so explicitly.
+          Serial.printf("[NET] Attached as CHILD after %lus. Reporting.\n",
+                        (unsigned long)(millis() / 1000UL));
         }
         esp_openthread_lock_release();
       }
+      // NVS outside the OT lock: a flash write can block for tens of ms and
+      // nothing here needs the stack held. Runs once, on the transition to
+      // CHILD — after this the enclosing `!g_child` guard stops the poll.
+      // Clearing the strikes means an outage weeks from now starts from a full
+      // budget rather than one attempt short of an erase.
+      if (g_child && netfail_get() != 0) netfail_set(0);
     }
     if (g_attach_deadline && (int32_t)(millis() - g_attach_deadline) >= 0) {
-      Serial.println("[NET] Stored network not found in 60s. Clearing credentials + rebooting to search for a new network.");
+      uint8_t n = netfail_get() + 1;
+      if (n < NET_FAIL_LIMIT) {
+        // Keep the credentials. Rebooting re-runs the whole attach from a clean
+        // radio state, which is what usually clears a wedged attach, and costs
+        // nothing but time.
+        netfail_set(n);
+        Serial.printf("[NET] Attach attempt %u/%u failed after %lus. Rebooting to RETRY with the same credentials.\n",
+                      (unsigned)n, (unsigned)NET_FAIL_LIMIT, OLD_NET_TIMEOUT_MS / 1000UL);
+        delay(200);
+        ESP.restart();                           // does not return
+      }
+      Serial.printf("[NET] %u consecutive attach failures. Clearing credentials + rebooting to search for a new network.\n",
+                    (unsigned)NET_FAIL_LIMIT);
+      netfail_set(0);                            // fresh budget for the next network
       leaveNetworkAndReboot();                   // does not return
     }
   }
