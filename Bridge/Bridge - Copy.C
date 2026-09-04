@@ -1,6 +1,5 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
-#include <esp_wifi.h>          // esp_wifi_get_ps(): verify power-save actually applied
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>   // TLS for HTTPS cloud endpoints
 #include <Update.h>
@@ -36,67 +35,14 @@ static const char *CLOUD_ROOT_CA = "";
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest. Publishing a build without bumping it means the
 // fleet politely refuses the update and reports itself up-to-date.
-#define BRIDGE_FW_VERSION 25
+#define BRIDGE_FW_VERSION 20
 
-// --- Logging ----------------------------------------------------------------
-// Severity levels with compile-time filtering: the standard embedded shape, and
-// the same one ESP-IDF (esp_log), Zephyr (LOG_*) and the kernel (KERN_*) use.
-// Anything above BRIDGE_LOG_LEVEL is removed by the preprocessor, so a disabled
-// call costs nothing at all -- no flash for the format string, no CPU, and no
-// chance of a log in a hot path perturbing timing-sensitive code.
-//
-// Deliberately NOT built on Arduino's log_e()/log_i(): those key off the IDE's
-// "Core Debug Level" menu, which defaults to None. A build made on a fresh
-// machine would ship silent -- errors included -- with nothing in the source to
-// explain why. The level belongs in the file, where it is reviewable.
-//
-// Production ships at INFO, matching ESP-IDF's own default. Errors, warnings and
-// state changes (Wi-Fi, gateway role, OTA, auth, boot) stay on the wire, because
-// a serial console is the first thing anyone attaches to a misbehaving unit in
-// the field; a fully mute build leaves a tech with nothing to read unless the
-// unit happens to panic. Per-reading and per-packet chatter compiles out.
-//
-// Raise to DEBUG for bring-up, VERBOSE for the full C6 UART firehose.
-//
-// Never pass a credential to these macros at any level. SSIDs go through
-// SSID_LOG(); Wi-Fi passwords and the admin PIN are never logged.
-#define BRIDGE_LOG_NONE     0
-#define BRIDGE_LOG_ERROR    1
-#define BRIDGE_LOG_WARN     2
-#define BRIDGE_LOG_INFO     3
-#define BRIDGE_LOG_DEBUG    4
-#define BRIDGE_LOG_VERBOSE  5
-
-#define BRIDGE_LOG_LEVEL    BRIDGE_LOG_INFO
-
-// #if rather than `if (level <= BRIDGE_LOG_LEVEL)`: a dead branch still leaves
-// the compiler free to keep the format string in flash, and the point of this is
-// that a disabled level leaves no trace in the image.
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_ERROR
-  #define LOGE(...) Serial.printf(__VA_ARGS__)
-#else
-  #define LOGE(...) do {} while (0)
-#endif
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_WARN
-  #define LOGW(...) Serial.printf(__VA_ARGS__)
-#else
-  #define LOGW(...) do {} while (0)
-#endif
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_INFO
-  #define LOGI(...) Serial.printf(__VA_ARGS__)
-#else
-  #define LOGI(...) do {} while (0)
-#endif
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_DEBUG
-  #define LOGD(...) Serial.printf(__VA_ARGS__)
-#else
-  #define LOGD(...) do {} while (0)
-#endif
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_VERBOSE
-  #define LOGV(...) Serial.printf(__VA_ARGS__)
-#else
-  #define LOGV(...) do {} while (0)
-#endif
+// Serial verbosity. 0 (default) = quiet: only essential events — BLE/auth,
+// commissioning, gateway role changes, Wi-Fi/provision, forward FAILURES, and
+// notable C6 lines (warnings/errors/joiner/network). 1 = firehose: echo every
+// raw C6 UART line + per-reading [SEEN+]/[FWD ok] + verbose status. Flip to 1
+// for deep bring-up debugging.
+#define BRIDGE_VERBOSE 0
 
 #include "bme_sensor.h"
 #include "rtc_ds1307.h"
@@ -154,14 +100,6 @@ NimBLECharacteristic *pCharacteristic = nullptr;
 Preferences preferences;
 
 volatile bool bleClientConnected = false;
-// --- On-demand management BLE ----------------------------------------------
-// millis() until which BLE stays up after a short button press; 0 = closed.
-// See bleShouldAdvertise() for why the gateway no longer advertises forever.
-static uint32_t g_bleWindowUntil = 0;
-// Set when the cloud asks for a BLE window; actioned in loop(), not in the HTTP
-// call that collected it.
-static volatile bool g_pendingBleWindow = false;
-static const uint32_t BLE_WINDOW_MS = 5UL * 60UL * 1000UL;
 volatile bool bleClientSecured = false;        // OS-Level Encryption (Just Works)
 volatile bool isSessionAuthenticated = false;  // App-Level Authentication
 
@@ -204,33 +142,6 @@ static void forwardReading(const String &eui, const String &data);
 static void forwardReadingCloud(const String &eui, const String &data);
 static void forwardEnvCloud(const String &eui, const String &csv);
 static void forwardCrashCloud(const String &eui, const String &payload);
-
-// Turn OFF Wi-Fi modem sleep, and do it after every association.
-//
-// Arduino defaults a STA to WIFI_PS_MIN_MODEM: the radio powers down between
-// DTIM beacons and wakes to listen. That puts power-state transitions right in
-// the middle of the MAC's transmit-completion bookkeeping -- which is precisely
-// where this unit keeps dying. Five panics, all identical: a load fault in
-// lmac_record_txtime called from lmacTxDone, faulting on a pointer that is a
-// VALID SRAM address with its top byte cleared (0x3fcd2ffc read as 0x00cd2ffc).
-// That is a torn or half-updated pointer, not a wild one -- the signature of
-// something reading a word while another context is writing it.
-//
-// This unit is mains-powered through the gateway, so the ~30 mA that modem sleep
-// saves buys us nothing and costs us the entire uplink every hour or so.
-//
-// Must be re-applied after each connect: esp_wifi_set_ps() does not survive a
-// re-init of the driver, and a silently re-enabled power save would look exactly
-// like "the fix didn't work".
-static void wifiDisableModemSleep() {
-  WiFi.setSleep(false);
-  // Read it back. A setting that silently failed to apply would be indis-
-  // tinguishable from "the theory was wrong", and that is the one confusion
-  // this experiment cannot afford.
-  wifi_ps_type_t ps = WIFI_PS_NONE;
-  if (esp_wifi_get_ps(&ps) == ESP_OK && ps != WIFI_PS_NONE)
-    LOGW("[WIFI] modem sleep STILL ON (ps=%d) -- power-save disable did not take\n", (int)ps);
-}
 
 // --- Discovery / data-forwarding to the display node ---
 // The discovery service is now merged onto the cloud server at "<cloud>/discovery",
@@ -348,11 +259,6 @@ volatile bool g_pendingReset = false;   // FACTORY_RESET requested from the BLE 
 // inline, so an HTTP call is never torn down mid-flight.
 volatile int g_pendingReboot = 0;
 volatile bool g_pendingScan  = false;   // SCAN? requested from the BLE task (run in loop)
-static uint32_t g_pendingScanSince = 0;  // millis of the SCAN? request (0 = none pending)
-// millis() of the last association attempt (0 = none yet). A scan started while
-// an association is still in flight puts the driver through a channel sweep in
-// the middle of the auth/assoc handshake, so the blocking scan waits this out.
-static uint32_t g_wifiConnectStartedMs = 0;
 // Feature 3: a panic report captured at boot from the core-dump partition,
 // "<reset>|<pc>|<bt>". Relayed to the C6 (which tags our EUI) once on-network.
 static String g_crashPayload = "";
@@ -388,7 +294,7 @@ static void blog(const char *fmt, ...) {
   int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
   va_end(ap);
   if (n <= 0) return;
-  LOGI("[LOG] %s\n", tmp);
+  Serial.printf("[LOG] %s\n", tmp);
 
   if (g_blogMagic != BLOG_MAGIC || g_blogLen >= BLOG_SZ) blogReset();
   size_t want = strlen(tmp) + 1;                 // +1 for the ';' separator
@@ -459,7 +365,7 @@ void handleProvisioning(const String &jsonPayload) {
   DeserializationError error = deserializeJson(doc, jsonPayload);
 
   if (error) {
-    LOGE("[JSON] Failed to parse provisioning payload\n");
+    Serial.println("[JSON] Failed to parse provisioning payload");
     bleNotifyLine("ERR JSON_INVALID");
     return;
   }
@@ -481,7 +387,7 @@ void handleProvisioning(const String &jsonPayload) {
   }
   String authMode = (wauth && strcmp(wauth, "peap") == 0) ? "peap" : "psk";
 
-  LOGI("[PROVISION] SSID: %s, Zone: %s, NetName: %s\n", SSID_LOG(ssid), zone, netName);
+  Serial.printf("[PROVISION] SSID: %s, Zone: %s, NetName: %s\n", SSID_LOG(ssid), zone, netName);
 
   // 1. Save to NVS
   preferences.begin("gateway_config", false);
@@ -513,7 +419,7 @@ void handleProvisioning(const String &jsonPayload) {
 
   // 2. Connect to Wi-Fi (drop any prior association first so switching to a
   //    different SSID on re-provisioning is reliable).
-  LOGI("[WIFI] Connecting to %s...\n", SSID_LOG(ssid));
+  Serial.printf("[WIFI] Connecting to %s...\n", SSID_LOG(ssid));
   bleNotifyLine("STATUS CONNECTING_WIFI");
 
   // NOTE: this runs on the NimBLE host task (onWrite -> handleProvisioning).
@@ -522,13 +428,10 @@ void handleProvisioning(const String &jsonPayload) {
   // the next crash report if that is what we were doing.
   blog("prov.wifi ble-task st=%d", (int)WiFi.status());
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(false);   // we own reconnection; see applyWifi()
-  WiFi.disconnect(false, true);   // disassociate + clear stored AP, radio stays up
+  WiFi.disconnect(true);
   delay(100);
-  g_wifiConnectStartedMs = millis();
   wifiBeginAuto(ssid, pass, authMode,
                 (euser ? String(euser) : String("")), (eid ? String(eid) : String("")));
-  wifiDisableModemSleep();
 
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 20) {
@@ -537,13 +440,13 @@ void handleProvisioning(const String &jsonPayload) {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    LOGI("[WIFI] Connected!\n");
+    Serial.println("[WIFI] Connected!");
     bleNotifyLine("WIFI_CONNECTED");
 
     // 3. Command Commissioner (Air-Gapped!)
     Serial1.printf("FORM_NET %s\n", netName);
     Serial1.flush();
-    LOGI("[UART] Sent FORM_NET command\n");
+    Serial.println("[UART] Sent FORM_NET command");
 
     // 4. Replicate these creds to the whole fleet via the mesh (C6 signs +
     //    multicasts). Every router stores them on standby so any unit can
@@ -558,13 +461,13 @@ void handleProvisioning(const String &jsonPayload) {
     Serial1.printf("cfg_publish %s|%s|%s|%s|%s\n",
                    ssid, pass, zone ? zone : "Default", netName, pinField);
     Serial1.flush();
-    LOGI("[UART] Sent cfg_publish for mesh-wide credential replication\n");
+    Serial.println("[UART] Sent cfg_publish for mesh-wide credential replication");
 
     // This unit just provisioned -> it will become the Leader/active gateway;
     // GW_ROLE LEADER from the C6 will (re)assert Wi-Fi after boot.
     isActiveGateway = true;
   } else {
-    LOGE("[WIFI] Failed to connect.\n");
+    Serial.println("[WIFI] Failed to connect.");
     bleNotifyLine("ERR WIFI_AUTH");
   }
 }
@@ -593,31 +496,15 @@ static void applyWifi(const String &ssid, const String &pass) {
   String euser = preferences.getString("euser", "");
   String eid   = preferences.getString("eid", "");
   preferences.end();
-  LOGI("[WIFI] (Re)connecting to %s [%s]...\n", SSID_LOG(ssid.c_str()), wauth.c_str());
+  Serial.printf("[WIFI] (Re)connecting to %s [%s]...\n", SSID_LOG(ssid.c_str()), wauth.c_str());
   // Breadcrumb either side of the teardown: 119 of 123 panics landed in
   // task=wifi, so knowing whether we were mid-reassociate when it died is the
   // single most useful thing the next crash report can carry.
   blog("wifi.apply st=%d heap=%u", (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
-
-  // Own the reconnect policy. The Arduino core re-associates by itself
-  // (_autoReconnect defaults to true, STA.cpp), which means the core's network
-  // event task can be driving a reconnect at the same instant this function is
-  // tearing the association down -- two writers, one driver state. Turn it off
-  // so wifiRetryIfDown() below is the single owner.
-  WiFi.setAutoReconnect(false);
-
-  // Disassociate WITHOUT stopping the radio. WiFi.disconnect(true) means
-  // wifioff=true, i.e. esp_wifi_stop(): the whole driver and its netif are torn
-  // down and rebuilt on every retry. That is far more state churn than a
-  // reconnect needs, and it is exactly the window in which a stale pointer into
-  // freed connection state gets dereferenced. eraseap=true still clears the
-  // stored AP config, so re-provisioning to a different SSID stays reliable.
-  WiFi.disconnect(false, true);
+  WiFi.disconnect(true);
   delay(100);
   wifiBeginAuto(ssid, pass, wauth, euser, eid);
-  wifiDisableModemSleep();
-  g_wifiConnectStartedMs = millis();
   blog("wifi.begun");
 }
 
@@ -671,7 +558,7 @@ static void handleCfgSet(const String &payload) {
   preferences.putString("net",  net);
   preferences.end();
 
-  LOGI("[CFG] Stored replicated creds (ssid=%s, net=%s)\n", SSID_LOG(ssid.c_str()), net.c_str());
+  Serial.printf("[CFG] Stored replicated creds (ssid=%s, net=%s)\n", SSID_LOG(ssid.c_str()), net.c_str());
 
   // Replicated admin PIN: store it so this unit accepts the same fleet PIN.
   if (pin.length() > 0 && pin != "-") {
@@ -679,7 +566,7 @@ static void handleCfgSet(const String &payload) {
     preferences.putString("pin", pin);
     preferences.putBool("is_setup", true);
     preferences.end();
-    LOGI("[CFG] Replicated admin PIN stored (fleet PIN updated).\n");
+    Serial.println("[CFG] Replicated admin PIN stored (fleet PIN updated).");
   }
 
   // If this unit is currently the active gateway, re-apply with the new creds.
@@ -688,57 +575,6 @@ static void handleCfgSet(const String &payload) {
 
 // --- C6 -> C3: gateway-role signal tied to Thread leadership ---
 // Payload: "LEADER" (this unit is the active gateway) or "STANDBY".
-//
-// Re-entrancy guard for the Wi-Fi retry below. The C6 re-sends GW_ROLE about
-// every 10s, and WiFi.status() stays non-CONNECTED for several seconds while an
-// association is in flight — so the NEXT LEADER line used to see "still down"
-// and call applyWifi() again on top of the one already running. applyWifi()
-// opens with WiFi.disconnect(true), so the second call tore down the association
-// the first was still building, and the wifi task then faulted reading a pointer
-// into the freed connection state.
-//
-// This is not a theory: the first v20 crash trail showed exactly two "wifi.apply"
-// breadcrumbs one role-message apart, immediately before a load access fault
-// (mcause=0x5) on 0x00cd5a2c — an unmapped address, i.e. a stale pointer. Heap
-// was 101 KB at the time, so it was never an exhaustion problem.
-//
-// A single reconnect attempt is allowed per cooldown; the timer clears the moment
-// we observe a live link, so a genuine drop still reconnects promptly.
-static const uint32_t WIFI_RETRY_COOLDOWN_MS = 30000;
-static uint32_t g_lastWifiRetry = 0;          // millis of the last attempt (0 = none yet)
-
-// The ONE place this unit re-associates from. Both callers (the GW_ROLE handler
-// and the gateway service block in loop()) go through here, so the cooldown is
-// global rather than per-call-site: previously the role handler held its own
-// timer while loop() had no retry at all, which meant a gateway whose C6 stopped
-// sending GW_ROLE never reconnected at all.
-// Returns true if an attempt was actually started.
-static bool wifiRetryIfDown(const char *why) {
-  if (WiFi.status() == WL_CONNECTED) {
-    g_lastWifiRetry = 0;        // link is up: let the next real drop retry at once
-    return false;
-  }
-  const uint32_t nowMs = millis();
-  if (g_lastWifiRetry != 0 && nowMs - g_lastWifiRetry < WIFI_RETRY_COOLDOWN_MS) {
-    // Serial only -- deliberately NOT a breadcrumb. loop() calls this on every
-    // iteration while the link is down, so a blog() here writes thousands of
-    // identical entries and evicts the entire 320-byte ring: the v22 crash trail
-    // was nothing but "wifi.retry held (loop.gw)" repeated, which told us
-    // nothing. The ring is a time budget, and only state CHANGES may spend it.
-    LOGD("[WIFI] retry held (%s)\n", why);
-    return false;
-  }
-  preferences.begin("gateway_config", true);
-  String ssid = preferences.getString("ssid", "");
-  String pass = preferences.getString("pass", "");
-  preferences.end();
-  if (ssid.isEmpty()) return false;   // nothing provisioned; don't arm the cooldown
-  g_lastWifiRetry = nowMs;
-  blog("wifi.retry %s", why);
-  applyWifi(ssid, pass);
-  return true;
-}
-
 static void handleGatewayRole(const String &role) {
   bool wantGateway = role.startsWith("LEADER");
   c6OnNetwork = true;  // any GW_ROLE means our C6 is a network member now
@@ -749,11 +585,16 @@ static void handleGatewayRole(const String &role) {
     standbyPending = false;
     if (!isActiveGateway) {
       isActiveGateway = true;
-      LOGI("[GW] Now ACTIVE gateway (Leader).\n");
+      Serial.println("[GW] Now ACTIVE gateway (Leader).");
     }
-    // Only retry if nothing is already in flight: the ~10s role message rate
-    // outruns association, and without the cooldown we re-tear-down mid-connect.
-    wifiRetryIfDown("gw.leader");
+    if (WiFi.status() != WL_CONNECTED) {
+      blog("gw.leader wifi-down -> reconnect");
+      preferences.begin("gateway_config", true);
+      String ssid = preferences.getString("ssid", "");
+      String pass = preferences.getString("pass", "");
+      preferences.end();
+      applyWifi(ssid, pass);
+    }
     updateBleAdvertising();
   } else {
     // STANDBY -> don't drop Wi-Fi immediately; start the grace timer. A
@@ -763,8 +604,7 @@ static void handleGatewayRole(const String &role) {
     if (isActiveGateway && !standbyPending) {
       standbyPending = true;
       standbyPendingSince = millis();
-      blog("gw.standby grace st=%d", (int)WiFi.status());
-      LOGI("[GW] STANDBY received — grace timer started before dropping Wi-Fi.\n");
+      Serial.println("[GW] STANDBY received — grace timer started before dropping Wi-Fi.");
     } else if (!isActiveGateway) {
       // Plain joined router (never the gateway): ensure management BLE is off.
       updateBleAdvertising();
@@ -791,10 +631,10 @@ static void discoverNode() {
         int port = fwd[0]["port"] | 8001;
         if (ip.length()) {
           String nu = "http://" + ip + ":" + String(port);
-          if (nu != g_nodeUrl) { g_nodeUrl = nu; LOGI("[DISC] display node -> %s\n", g_nodeUrl.c_str()); }
+          if (nu != g_nodeUrl) { g_nodeUrl = nu; Serial.printf("[DISC] display node -> %s\n", g_nodeUrl.c_str()); }
         }
       } else {
-        LOGW("[DISC] no display node registered yet (run display_node.py)\n");
+        Serial.println("[DISC] no display node registered yet (run display_node.py)");
       }
     }
   } else {
@@ -802,7 +642,7 @@ static void discoverNode() {
     uint32_t mult = 1u << (g_discFails > 5 ? 5 : g_discFails);   // 1,2,4,8,16,32
     g_discoverIntervalMs = DISCOVER_INTERVAL_MS * mult;
     if (g_discoverIntervalMs > DISCOVER_MAX_INTERVAL_MS) g_discoverIntervalMs = DISCOVER_MAX_INTERVAL_MS;
-    LOGW("[DISC] /discover failed (HTTP %d) @ %s — backing off to %lus\n",
+    Serial.printf("[DISC] /discover failed (HTTP %d) @ %s — backing off to %lus\n",
                   code, g_discoveryUrl.c_str(), (unsigned long)(g_discoverIntervalMs / 1000));
   }
   http.end();
@@ -840,9 +680,10 @@ static void forwardReading(const String &eui, const String &data) {
   int code = http.POST(body);
   http.end();
   if (code > 0) {
-    LOGD("[FWD] %s -> %s/ingest (%d)\n", eui.c_str(), g_nodeUrl.c_str(), code);
+    if (BRIDGE_VERBOSE)
+      Serial.printf("[FWD] %s -> %s/ingest (%d)\n", eui.c_str(), g_nodeUrl.c_str(), code);
   } else {
-    LOGE("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
+    Serial.printf("[FWD] %s -> /ingest FAILED (%d) — re-discovering\n", eui.c_str(), code);
     g_nodeUrl = "";   // node unreachable -> force a re-discover (kept: it's an error)
   }
 }
@@ -885,9 +726,10 @@ static void forwardReadingCloud(const String &eui, const String &data) {
 
   g_cloudOk = (code > 0);   // reached the server (any HTTP response) -> uplink LED solid
   if (code > 0) {
-    LOGD("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
+    if (BRIDGE_VERBOSE)
+      Serial.printf("[CLOUD] %s -> %s/v1/readings (%d)\n", eui.c_str(), g_cloudUrl.c_str(), code);
   } else {
-    LOGE("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
+    Serial.printf("[CLOUD] %s -> /v1/readings FAILED (%d)\n", eui.c_str(), code);
   }
 }
 
@@ -909,28 +751,6 @@ static void updateUplinkLed() {
   } else {
     on = true;                               // gateway + cloud up: solid
   }
-  // BLE is OVERLAID on the uplink state, not substituted for it. There is only
-  // one LED, and blanking the uplink status for the five minutes BLE is open
-  // would hide the cloud going down during exactly the window when someone is
-  // stood at the unit trying to fix something.
-  //
-  // Each cycle opens with two forced pulses and a forced dark gap, readable
-  // whatever the underlying state including solid. The REST of the cycle is the
-  // normal uplink indication, so one LED carries both facts:
-  //
-  //   blip-blip then solid     gateway + cloud up, BLE open
-  //   blip-blip then blinking  cloud unreachable, BLE open
-  //   blip-blip then dark      standby / no uplink, BLE open
-  //
-  // The cycle shortens once an app connects, so it also confirms the pairing
-  // worked without opening the app.
-  if (bleStackUp) {
-    const uint32_t period = bleClientConnected ? 700 : 1500;
-    const uint32_t t = now % period;
-    if (t < 90 || (t >= 220 && t < 310)) on = true;        // the two pulses
-    else if (t < 400) on = false;                          // gap, so they read
-  }
-
   digitalWrite(UPLINK_LED_PIN, on ? HIGH : LOW);
 }
 
@@ -973,8 +793,8 @@ static void forwardEnvCloud(const String &eui, const String &csv) {
     code = http.POST(body);
     http.end();
   }
-  if (code <= 0) LOGE("[ENV] %s -> /v1/env FAILED (%d)\n", eui.c_str(), code);
-  else LOGD("[ENV] %s -> /v1/env (%d)\n", eui.c_str(), code);
+  if (code <= 0) Serial.printf("[ENV] %s -> /v1/env FAILED (%d)\n", eui.c_str(), code);
+  else if (BRIDGE_VERBOSE) Serial.printf("[ENV] %s -> /v1/env (%d)\n", eui.c_str(), code);
 }
 
 // --- Forward a firmware crash report to the cloud (Feature 3). Only the active
@@ -1020,7 +840,7 @@ static void forwardCrashCloud(const String &eui, const String &payload) {
     code = http.POST(body);
     http.end();
   }
-  LOGE("[CRASH] %s -> /v1/crashes (%d)\n", eui.c_str(), code);
+  Serial.printf("[CRASH] %s -> /v1/crashes (%d)\n", eui.c_str(), code);
 }
 
 // --- Record that we just heard from a sensor EUI (for the NODES? dropdown) ---
@@ -1139,24 +959,19 @@ static void forwardMeshCloud() {
   // away — no new endpoint or poll needed.
   String resp = (code == HTTP_CODE_OK) ? http.getString() : String();
   http.end();
-  LOGD("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
+  Serial.printf("[CLOUD] mesh roster (%d nodes) -> %s/v1/mesh (%d)\n", n, g_cloudUrl.c_str(), code);
 
   if (resp.length()) {
     DynamicJsonDocument rdoc(256);
     if (!deserializeJson(rdoc, resp)) {
       String what = String((const char *)(rdoc["reboot"] | ""));
-      // Remote "open the BLE window", the dashboard equivalent of a short
-      // button press. Queued like a restart rather than acted on here: this
-      // runs inside an HTTP call, and bringing the BLE stack up from here would
-      // reconfigure the shared radio underneath the socket we are still using.
-      if ((int)(rdoc["ble"] | 0) == 1) g_pendingBleWindow = true;
       if (what.length()) {
         // Queue it; rebooting inside an HTTP call would strand the socket and
         // the WDT bracket in loop() expects to own restarts (see g_pendingReset).
         if      (what == "c3")   g_pendingReboot = 1;
         else if (what == "c6")   g_pendingReboot = 2;
         else if (what == "both") g_pendingReboot = 3;
-        LOGI("[CLOUD] restart requested from dashboard: %s\n", what.c_str());
+        Serial.printf("[CLOUD] restart requested from dashboard: %s\n", what.c_str());
       }
     }
   }
@@ -1220,14 +1035,14 @@ static void pollOtaJob() {
   bool fleetC6 = okC6 && c6stage == "full" && c6v > g_bcastC6;
 
   if (selfC3 || selfC6) {
-    LOGI("[OTAPOLL] canary -> gateway self-update (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
+    Serial.printf("[OTAPOLL] canary -> gateway self-update (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
     g_fleetOtaBaseUrl = g_cloudUrl;            // self-update only: no ota_broadcast
     g_fleetOtaAt = millis() + 3000;
     g_fleetOtaPending = true;
   } else if (fleetC3 || fleetC6) {
     if (fleetC3) g_bcastC3 = c3v;
     if (fleetC6) g_bcastC6 = c6v;
-    LOGI("[OTAPOLL] full -> fleet OTA broadcast (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
+    Serial.printf("[OTAPOLL] full -> fleet OTA broadcast (c3 v%d, c6 v%d) from cloud\n", c3v, c6v);
     Serial1.println("ota_broadcast " + g_cloudUrl);   // C6 signs + multicasts OTA_NOW <cloud>
   }
 }
@@ -1265,47 +1080,26 @@ static void otaC3FromUrl(const String &url) {
   }
 
   int len = http.getSize();                 // -1 if chunked/unknown
-  // Refuse an image whose size we cannot check. Nothing in this path verifies
-  // the payload -- there is no sha256 in the manifest -- so Content-Length is
-  // the only integrity signal available. Without it, a connection that dies
-  // half-way still ends with Update.end(true) succeeding (the header the ESP32
-  // validates lives in the first few KB), and the unit reboots into a truncated
-  // image with no working uplink left to recover over.
-  if (len <= 0) {
-    LOGE("[OTA] server sent no Content-Length; refusing unverifiable image\n");
-    bleNotifyLine("ERR OTA NO_LENGTH");
-    http.end();
-    return;
-  }
-  if (!Update.begin((size_t)len)) {
+  if (!Update.begin(len > 0 ? (size_t)len : UPDATE_SIZE_UNKNOWN)) {
     bleNotifyLine("ERR OTA NOSPACE");
     http.end();
     return;
   }
 
-  LOGI("[OTA] Downloading C3 image (%d bytes)...\n", len);
+  Serial.printf("[OTA] Downloading C3 image (%d bytes)...\n", len);
   bleNotifyLine("OTA DOWNLOADING");
 
   WiFiClient *stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   http.end();
 
-  // A short read means a truncated download. Bail out BEFORE Update.end(true),
-  // which is the call that marks the new partition bootable.
-  if (written != (size_t)len) {
-    LOGE("[OTA] truncated: %u of %d bytes; aborting\n", (unsigned)written, len);
-    Update.abort();
-    bleNotifyLine("ERR OTA TRUNCATED " + String((unsigned)written) + "/" + String(len));
-    return;
-  }
-
   if (!Update.end(true)) {
-    LOGE("[OTA] failed: %s\n", Update.errorString());
+    Serial.printf("[OTA] failed: %s\n", Update.errorString());
     bleNotifyLine("ERR OTA " + String(Update.getError()));
     return;
   }
 
-  LOGI("[OTA] C3 update OK (%u bytes). Rebooting...\n", (unsigned)written);
+  Serial.printf("[OTA] C3 update OK (%u bytes). Rebooting...\n", (unsigned)written);
   bleNotifyLine("OTA SUCCESS REBOOTING");
   delay(500);
   ESP.restart();
@@ -1345,7 +1139,7 @@ static void performOtaCheck() {
 
   int c3ver = doc["c3_version"] | 0;
   String c3file = manifestFile(doc, "c3");
-  LOGI("[OTA] manifest c3_version=%d file='%s' (running %d)\n",
+  Serial.printf("[OTA] manifest c3_version=%d file='%s' (running %d)\n",
                 c3ver, c3file.c_str(), BRIDGE_FW_VERSION);
 
   // A manifest that advertises a version but no filename is a SERVER fault, not
@@ -1390,7 +1184,7 @@ static bool waitForUart(const String &expected, uint32_t timeoutMs) {
         pos = 0;
         if (line.startsWith(expected)) return true;
         if (line.startsWith("OTA_ERR")) {
-          LOGI("[OTAC6] C6 reported: %s\n", line.c_str());
+          Serial.println("[OTAC6] C6 reported: " + line);
           return false;
         }
       } else if (c != '\r' && pos < (int)sizeof(buf) - 1) {
@@ -1427,7 +1221,7 @@ static bool otaC6FromUrl(const String &url) {
   Serial1.flush();
   if (!waitForUart("OTA_READY", 8000)) { bleNotifyLine("ERR OTAC6 NOREADY"); http.end(); return false; }
 
-  LOGI("[OTAC6] streaming %d bytes to C6...\n", total);
+  Serial.printf("[OTAC6] streaming %d bytes to C6...\n", total);
   bleNotifyLine("OTAC6 START " + String(total));
 
   const size_t CHUNK = 512;
@@ -1457,7 +1251,7 @@ static bool otaC6FromUrl(const String &url) {
   Serial1.flush();
   if (!waitForUart("OTA_DONE", 15000)) { bleNotifyLine("ERR OTAC6 NODONE"); return false; }
 
-  LOGI("[OTAC6] C6 update complete; C6 is rebooting.\n");
+  Serial.println("[OTAC6] C6 update complete; C6 is rebooting.");
   bleNotifyLine("OTAC6 SUCCESS");
   return true;
 }
@@ -1488,34 +1282,34 @@ static void performFleetOta(const String &baseurl) {
     String s = preferences.getString("ssid", "");
     String p = preferences.getString("pass", "");
     preferences.end();
-    if (s.isEmpty()) { LOGE("[FLEETOTA] no Wi-Fi creds; abort\n"); return; }
+    if (s.isEmpty()) { Serial.println("[FLEETOTA] no Wi-Fi creds; abort"); return; }
     applyWifi(s, p);
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
-    if (WiFi.status() != WL_CONNECTED) { LOGE("[FLEETOTA] Wi-Fi failed; abort\n"); return; }
+    if (WiFi.status() != WL_CONNECTED) { Serial.println("[FLEETOTA] Wi-Fi failed; abort"); return; }
   }
 
   HTTPClient http;
   http.setConnectTimeout(3000);
   http.setTimeout(5000);
-  if (!http.begin(baseurl + "/firmware/manifest.json")) { LOGE("[FLEETOTA] manifest begin fail\n"); return; }
-  if (http.GET() != HTTP_CODE_OK) { LOGE("[FLEETOTA] manifest HTTP fail\n"); http.end(); return; }
+  if (!http.begin(baseurl + "/firmware/manifest.json")) { Serial.println("[FLEETOTA] manifest begin fail"); return; }
+  if (http.GET() != HTTP_CODE_OK) { Serial.println("[FLEETOTA] manifest HTTP fail"); http.end(); return; }
   DynamicJsonDocument doc(512);
   DeserializationError e = deserializeJson(doc, http.getString());
   http.end();
-  if (e) { LOGE("[FLEETOTA] manifest json fail\n"); return; }
+  if (e) { Serial.println("[FLEETOTA] manifest json fail"); return; }
 
   int c3ver = doc["c3_version"] | 0; String c3file = manifestFile(doc, "c3");
   int c6ver = doc["c6_version"] | 0; String c6file = manifestFile(doc, "c6");
-  LOGI("[FLEETOTA] manifest c3=%d '%s' (run %d), c6=%d '%s' (run %d)\n",
+  Serial.printf("[FLEETOTA] manifest c3=%d '%s' (run %d), c6=%d '%s' (run %d)\n",
                 c3ver, c3file.c_str(), BRIDGE_FW_VERSION,
                 c6ver, c6file.c_str(), g_c6Version);
   // Say so out loud: a newer build we can't name is a broken manifest, and the
   // "complete (or already up-to-date)" line below would otherwise bury it.
   if (c3ver > BRIDGE_FW_VERSION && c3file.isEmpty())
-    LOGW("[FLEETOTA] c3 update advertised but manifest names no file -- skipping\n");
+    Serial.println("[FLEETOTA] c3 update advertised but manifest names no file -- skipping");
   if (c6ver > g_c6Version && c6file.isEmpty())
-    LOGW("[FLEETOTA] c6 update advertised but manifest names no file -- skipping\n");
+    Serial.println("[FLEETOTA] c6 update advertised but manifest names no file -- skipping");
 
   // C6 first (it reboots independently; the C3 stays up to stream it).
   if (!c6file.isEmpty() && c6ver > g_c6Version) {
@@ -1525,17 +1319,17 @@ static void performFleetOta(const String &baseurl) {
   if (!c3file.isEmpty() && c3ver > BRIDGE_FW_VERSION) {
     otaC3FromUrl(baseurl + "/firmware/" + c3file);
   }
-  LOGI("[FLEETOTA] complete (or already up-to-date)\n");
+  Serial.println("[FLEETOTA] complete (or already up-to-date)");
 }
 
 // Wipe this unit (C3 NVS + tell the C6 to wipe) and reboot.
 static void doFactoryReset() {
-  LOGW("\n[SYSTEM] === FACTORY RESET INITIATED ===\n");
+  Serial.println("\n[SYSTEM] === FACTORY RESET INITIATED ===");
   nvs_flash_erase();
   nvs_flash_init();
   Serial1.println("factory_reset");      // wipe the C6 too (matches its UART command)
   Serial1.flush();
-  LOGW("[SYSTEM] NVS cleared + Commissioner reset sent. Rebooting...\n");
+  Serial.println("[SYSTEM] NVS cleared + Commissioner reset sent. Rebooting...");
   deinitBLE();
   WiFi.disconnect(true);
   delay(2000);
@@ -1561,7 +1355,8 @@ static void parsePendingFromCommand(const String &cmdLine) {
   g_pendingEui64 = eui;
   g_pendingDeadlineMs = millis() + ADD_RESULT_TIMEOUT_MS;
 
-  LOGD("[STATE] Pending add set for EUI64=%s\n", g_pendingEui64.c_str());
+  Serial.print("[STATE] Pending add set for EUI64=");
+  Serial.println(g_pendingEui64);
 }
 
 // --- UART Handlers (UPDATED V1.2 LOGIC) ---
@@ -1616,7 +1411,7 @@ static void handleCommissionerLine(const String &line) {
     uint32_t delayMs = isActiveGateway ? 90000UL : (5000UL + (uint32_t)random(0, 40000));
     g_fleetOtaAt = millis() + delayMs;
     g_fleetOtaPending = true;
-    LOGI("[FLEETOTA] scheduled in %lus (gateway=%d) from %s\n",
+    Serial.printf("[FLEETOTA] scheduled in %lus (gateway=%d) from %s\n",
                   (unsigned long)(delayMs / 1000), isActiveGateway, g_fleetOtaBaseUrl.c_str());
     return;
   }
@@ -1642,7 +1437,7 @@ static void handleCommissionerLine(const String &line) {
           // is never empty. Only the ACTIVE gateway forwards (avoids duplicates).
           noteSeenEui(eui);
           noteProbes(eui, data);                        // cache probe ROMs for PROBES?
-          LOGV("[SEEN+] %s\n", eui.c_str());
+          if (BRIDGE_VERBOSE) Serial.printf("[SEEN+] %s\n", eui.c_str());   // diag (verbose only)
           if (isActiveGateway) forwardReading(eui, data);
         }
       } else if (payload.startsWith("ENV=")) {
@@ -1680,7 +1475,8 @@ static void handleCommissionerLine(const String &line) {
   // 2. Check for Joiner Success (Standard OpenThread log or Custom)
   if (line.indexOf("JOINER_ADDED") >= 0 || line.indexOf("JOINER_EVENT CONNECTED") >= 0) {
     String ack = "ACK ADD " + g_pendingEui64;
-    LOGI("[PROTO] %s\n", ack.c_str());
+    Serial.print("[PROTO] ");
+    Serial.println(ack);
     bleNotifyLine(ack);
 
     g_pendingAdd = false;
@@ -1692,7 +1488,8 @@ static void handleCommissionerLine(const String &line) {
   // Matches the new "JOINER_EVENT REMOVED" log we added in commissioner.c
   if (line.indexOf("JOINER_EVENT REMOVED") >= 0) {
     String err = "ERR ADD " + g_pendingEui64 + " timeout";
-    LOGW("[PROTO] %s\n", err.c_str());
+    Serial.print("[PROTO] ");
+    Serial.println(err);
     bleNotifyLine(err);
 
     g_pendingAdd = false;
@@ -1703,7 +1500,8 @@ static void handleCommissionerLine(const String &line) {
   // 3. Check for Generic Errors
   if (line.indexOf("ERROR") >= 0 || line.indexOf("FAILED") >= 0) {
     String err = "ERR ADD " + g_pendingEui64 + " commissioner_error";
-    LOGE("[PROTO] %s\n", err.c_str());
+    Serial.print("[PROTO] ");
+    Serial.println(err);
     bleNotifyLine(err);
 
     g_pendingAdd = false;
@@ -1726,13 +1524,13 @@ class BridgeServerCallbacks : public NimBLEServerCallbacks {
       g_bleFlapCount++;
       if (now - g_bleSummaryMs >= BLE_FLAP_SUMMARY_MS) {   // collapse the storm
         g_bleSummaryMs = now;
-        LOGW("[BLE] %s flapping — %lu connect/drop cycles (last reason=%d); check pairing/bond\n",
+        Serial.printf("[BLE] %s flapping — %lu connect/drop cycles (last reason=%d); check pairing/bond\n",
                       addr.c_str(), (unsigned long)g_bleFlapCount, g_bleLastReason);
       }
     } else {
       g_bleFlapCount = 0;
       g_bleSummaryMs = now;
-      LOGI("[BLE] Connected: %s\n", addr.c_str());
+      Serial.printf("[BLE] Connected: %s\n", addr.c_str());
     }
     g_bleLastCentral = addr;
     g_bleLastConnMs = now;
@@ -1748,24 +1546,24 @@ class BridgeServerCallbacks : public NimBLEServerCallbacks {
     // log the disconnect WITH its reason code (e.g. 13=remote term, 8=supervision
     // timeout, 61/0x3d=encryption/MIC failure => stale bond).
     if (g_bleFlapCount == 0) {
-      LOGI("[BLE] Disconnected (reason=%d)\n", reason);
+      Serial.printf("[BLE] Disconnected (reason=%d)\n", reason);
     }
 
     if (bleShouldAdvertise()) {
       NimBLEDevice::startAdvertising();
-      if (g_bleFlapCount == 0) LOGD("[BLE] Restarted Advertising.\n");
+      if (g_bleFlapCount == 0) Serial.println("[BLE] Restarted Advertising.");
     }
   }
 
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     if (!connInfo.isEncrypted()) {
-      LOGW("[BLE] Auth failed/unencrypted. Disconnecting.\n");
+      Serial.println("[BLE] Auth failed/unencrypted. Disconnecting.");
       NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
       bleClientSecured = false;
       return;
     }
     bleClientSecured = true;
-    LOGI("[BLE] Secured Link Established (OS-Level).\n");
+    Serial.println("[BLE] Secured Link Established (OS-Level).");
     bleNotifyLine("BRIDGE READY");
   }
 };
@@ -1774,7 +1572,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo &connInfo) override {
     // 1. OS-Level Security Check
     if (!bleClientSecured) {
-      LOGW("[BLE] Rejected write (Link Not Secured)\n");
+      Serial.println("[BLE] Rejected write (Link Not Secured)");
       return;
     }
 
@@ -1812,10 +1610,10 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       if (attemptPin == savedPin) {
         isSessionAuthenticated = true;
         bleNotifyLine("ACK AUTH SUCCESS");
-        LOGI("[AUTH] Session Unlocked\n");
+        Serial.println("[AUTH] Session Unlocked");
       } else {
         bleNotifyLine("ERR AUTH FAILED");
-        LOGW("[AUTH] Failed login attempt\n");
+        Serial.println("[AUTH] Failed login attempt");
       }
       return;
     }
@@ -1839,10 +1637,10 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
           isSessionAuthenticated = true;  // Auto-login after setup
           pinChanged = true;
           bleNotifyLine("ACK SETPIN SUCCESS");
-          LOGI("[AUTH] PIN updated and session unlocked\n");
+          Serial.println("[AUTH] PIN updated and session unlocked");
         } else {
           bleNotifyLine("ERR SETPIN FAILED");
-          LOGW("[AUTH] SETPIN failed: Old PIN mismatch\n");
+          Serial.println("[AUTH] SETPIN failed: Old PIN mismatch");
         }
         preferences.end();
 
@@ -1861,9 +1659,9 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
             Serial1.printf("cfg_publish %s|%s|%s|%s|%s\n",
                            s.c_str(), p.c_str(), z.c_str(), n.c_str(), newPin.c_str());
             Serial1.flush();
-            LOGI("[AUTH] Published new fleet PIN via mesh.\n");
+            Serial.println("[AUTH] Published new fleet PIN via mesh.");
           } else {
-            LOGI("[AUTH] PIN set; will replicate once Wi-Fi is provisioned.\n");
+            Serial.println("[AUTH] PIN set; will replicate once Wi-Fi is provisioned.");
           }
         }
       } else {
@@ -1896,7 +1694,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     // ==========================================
     // Everything that changes state requires an authenticated session.
     if (!isSessionAuthenticated && !isReadOnlyQuery) {
-      LOGW("[BLE] Rejected write (App-Level Unauthenticated)\n");
+      Serial.println("[BLE] Rejected write (App-Level Unauthenticated)");
       bleNotifyLine("ERR UNAUTHENTICATED");
       return;
     }
@@ -1907,7 +1705,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 
     // A. PROVISION
     if (cmdLine.startsWith("PROVISION|")) {
-      LOGI("[BLE] Received Provisioning Payload\n");
+      Serial.println("[BLE] Received Provisioning Payload");
       String jsonPart = cmdLine.substring(10);
       handleProvisioning(jsonPart);
       return;
@@ -1929,7 +1727,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         }
       }
       bleNotifyLine(resp);
-      LOGD("[NODES?] replied %d live\n", count);   // diag
+      Serial.printf("[NODES?] replied %d live\n", count);   // diag
       return;
     }
 
@@ -1966,7 +1764,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         }
       }
       bleNotifyLine(resp);
-      LOGD("[PROBES?] %s\n", eui.c_str());
+      Serial.printf("[PROBES?] %s\n", eui.c_str());
       return;
     }
 
@@ -1989,7 +1787,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         slot.toUpperCase();
         bool ok = registerSensorMap(eui, box, slot, label);
         bleNotifyLine(ok ? "ACK MAP " + eui : "ERR MAP NODE_UNREACHABLE");
-        LOGD("[MAP] %s -> box%d-%s (%s) %s\n",
+        Serial.printf("[MAP] %s -> box%d-%s (%s) %s\n",
                       eui.c_str(), box, slot.c_str(), ok ? "ok" : "failed", label.c_str());
       } else {
         bleNotifyLine("ERR MAP FORMAT");
@@ -2008,7 +1806,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
       Serial1.println("ota_broadcast " + g_nodeUrl);   // C6 signs + multicasts it
       Serial1.flush();
       bleNotifyLine("OTA_FLEET BROADCASTING");
-      LOGI("[FLEETOTA] broadcast requested -> %s\n", g_nodeUrl.c_str());
+      Serial.println("[FLEETOTA] broadcast requested -> " + g_nodeUrl);
       return;
     }
 
@@ -2050,7 +1848,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 
     // B. ADD (Busy Check)
     if (g_pendingAdd && cmdLine.startsWith("add ")) {
-      LOGW("[BLE] Rejecting add: Busy\n");
+      Serial.println("[BLE] Rejecting add: Busy");
       bleNotifyLine("ERR BUSY");
       return;
     }
@@ -2065,7 +1863,7 @@ class BridgeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
 
     Serial1.print(cmdLine);
     Serial1.flush();
-    LOGD("[UART] Forwarded full command (%d bytes)\n", cmdLine.length());
+    Serial.printf("[UART] Forwarded full command (%d bytes)\n", cmdLine.length());
   }
 };
 
@@ -2096,45 +1894,15 @@ void configureBLE() {
   pAdvertising->addServiceUUID(SERVICE_UUID);
 
   NimBLEDevice::startAdvertising();
-  LOGI("[BLE] Stack Initialized & Advertising as %s.\n", devName);
+  Serial.printf("[BLE] Stack Initialized & Advertising as %s.\n", devName);
 }
 
 // --- BLE management-endpoint gating ---
 // Only the ACTIVE gateway (Thread Leader) advertises for management, so the app
 // sees a single device. A unit not yet on a network advertises only when placed
 // in setup mode (switch), so a fresh unit can still be provisioned.
-// When management BLE should be up.
-//
-// The gateway used to advertise permanently, so BLE and Wi-Fi contended for the
-// C3's single 2.4 GHz radio every second of every day. Eight panics across five
-// firmware versions have ALL landed in the Wi-Fi MAC's transmit-completion path
-// (lmac_record_txtime <- lmacTxDone), every one of them on a pointer that had
-// lost its top byte -- the signature of a word being read while something else
-// wrote it. Coexistence arbitration is the last thing still interleaving with
-// that path that we have not taken away.
-//
-// So BLE is now ON DEMAND: a short press of the reset button opens a 5-minute
-// window, and it stays up beyond that for as long as an app is connected.
-//
-// Two cases still advertise unconditionally, and must:
-//   - a fresh or unprovisioned unit, or there would be no way to commission it;
-//   - a live client, so an in-progress session is never cut off mid-write.
 static bool bleShouldAdvertise() {
-  if (isCommissionerMode && !c6OnNetwork) return true;   // must stay reachable
-  if (bleClientConnected) return true;                   // don't drop a session
-  // Signed compare so the window survives the millis() rollover at 49.7 days.
-  return g_bleWindowUntil != 0 &&
-         (int32_t)(millis() - g_bleWindowUntil) < 0;
-}
-
-// Open the on-demand BLE window (short press of the reset button).
-static void bleOpenWindow() {
-  g_bleWindowUntil = millis() + BLE_WINDOW_MS;
-  if (g_bleWindowUntil == 0) g_bleWindowUntil = 1;   // 0 is the "closed" sentinel
-  blog("ble.window open");
-  LOGI("[BLE] Management window open for %lus -- connect from the app now.\n",
-       (unsigned long)(BLE_WINDOW_MS / 1000));
-  updateBleAdvertising();
+  return isActiveGateway || (isCommissionerMode && !c6OnNetwork);
 }
 
 static void updateBleAdvertising() {
@@ -2160,7 +1928,7 @@ void deinitBLE() {
   pServer = nullptr;
   pService = nullptr;
   pCharacteristic = nullptr;
-  LOGI("[BLE] Stack De-initialized (Secure Mode).\n");
+  Serial.println("[BLE] Stack De-initialized (Secure Mode).");
 }
 
 // ===========================================================================
@@ -2187,7 +1955,7 @@ static uint32_t g_healthLastLog   = 0;
 static uint32_t g_criticalSince   = 0;   // millis when memory first went critical (0 = healthy)
 
 static void safeReboot(const char *why) {
-  LOGW("[HEALTH] REBOOT: %s (free=%u largest=%u up=%lus)\n",
+  Serial.printf("[HEALTH] REBOOT: %s (free=%u largest=%u up=%lus)\n",
                 why, ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
                 (unsigned long)(millis() / 1000));
   Serial.flush();
@@ -2202,7 +1970,7 @@ static void bleSelfHeal() {
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   if (adv && !adv->isAdvertising() && !bleClientConnected) {
     NimBLEDevice::startAdvertising();
-    LOGW("[BLE] self-heal: advertising was down -> restarted.\n");
+    Serial.println("[BLE] self-heal: advertising was down -> restarted.");
   }
 }
 
@@ -2216,7 +1984,7 @@ static void healthMonitor() {
 
   if (now - g_healthLastLog >= HEALTH_LOG_MS) {
     g_healthLastLog = now;
-    LOGD("[HEAP] free=%u min=%u largest=%u up=%lus\n",
+    Serial.printf("[HEAP] free=%u min=%u largest=%u up=%lus\n",
                   freeHeap, ESP.getMinFreeHeap(), largest, (unsigned long)(now / 1000));
   }
 
@@ -2235,7 +2003,7 @@ static void healthMonitor() {
   if (!critical) { g_criticalSince = 0; return; }
   if (g_criticalSince == 0) {
     g_criticalSince = now;
-    LOGE("[HEALTH] memory critical (free=%u largest=%u) — reboot pending\n", freeHeap, largest);
+    Serial.printf("[HEALTH] memory critical (free=%u largest=%u) — reboot pending\n", freeHeap, largest);
     return;
   }
   if (now - g_criticalSince < HEALTH_PERSIST_MS) return;          // wait out a blip
@@ -2261,7 +2029,7 @@ static void captureCrashAtBoot() {
     case ESP_RST_POWERON:  reason = "poweron";  break;
     default:               reason = "other";    break;
   }
-  LOGI("[BOOT] reset reason: %s\n", reason);
+  Serial.printf("[BOOT] reset reason: %s\n", reason);
 
   String pc = "", bt = "", detail = "";
   if (esp_core_dump_image_check() == ESP_OK) {
@@ -2288,29 +2056,13 @@ static void captureCrashAtBoot() {
 #endif
       // First bytes of the app ELF hash: proves which build an address belongs
       // to. Decoding a PC against the wrong ELF gives a confidently wrong answer.
-      char sha[16];   // " elf=" + 8 hex + NUL = 14; the old [12] silently clipped a byte
+      char sha[12];
       snprintf(sha, sizeof(sha), " elf=%02x%02x%02x%02x",
                sum->app_elf_sha256[0], sum->app_elf_sha256[1],
                sum->app_elf_sha256[2], sum->app_elf_sha256[3]);
       detail += sha;
     }
     if (sum) free(sum);
-    // The abort REASON — the one thing the summary omits. On a deliberate abort
-    // (assert / ESP_ERROR_CHECK / stack canary / FreeRTOS overflow) pc lands in
-    // panic_abort and mcause=2 is merely the `unimp` the panic handler executes,
-    // so pc/ra name the messenger, not the sender. The v21 tiT crash decoded to
-    // exactly that: panic_abort <- esp_system_abort <- ???. IDF stores the
-    // reason string in the dump header; read it before the erase below. It goes
-    // BEFORE the trail so it survives the 300-byte relay truncation — the trail
-    // has already told its story, the reason is what we are still missing.
-    {
-      char why[128];
-      if (esp_core_dump_get_panic_reason(why, sizeof(why)) == ESP_OK && why[0]) {
-        for (char *c = why; *c; ++c) if (*c == '\n' || *c == '\r') *c = ' ';
-        detail += " reason=";
-        detail += why;
-      }
-    }
     esp_core_dump_image_erase();   // report it once
   }
 
@@ -2335,7 +2087,7 @@ static void captureCrashAtBoot() {
 
   if (isCrash || pc.length() > 0) {
     g_crashPayload = String(reason) + "|" + pc + "|" + bt + "|" + detail;
-    LOGE("[CRASH] captured: %s pc=%s %s\n", reason, pc.c_str(), detail.c_str());
+    Serial.printf("[CRASH] captured: %s pc=%s %s\n", reason, pc.c_str(), detail.c_str());
   }
 }
 
@@ -2359,14 +2111,14 @@ void setup() {
   pinMode(UPLINK_LED_PIN, OUTPUT);
   digitalWrite(UPLINK_LED_PIN, LOW);   // off until we become the active gateway
 
-  LOGI("\n[BOOT] Bridge Starting...\n");
-  LOGI("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?/PROBES?; 30s live window\n", BRIDGE_FW_VERSION);
+  Serial.println("\n[BOOT] Bridge Starting...");
+  Serial.printf("[BOOT] C3 fw v%d — single-notify NODES?/ROUTERS?/PROBES?; 30s live window\n", BRIDGE_FW_VERSION);
   captureCrashAtBoot();   // Feature 3: read a saved panic core dump, forward later
 
   // Initialize Authentication Defaults if first boot
   preferences.begin(AUTH_NAMESPACE, false);
   if (!preferences.isKey("is_setup")) {
-    LOGI("[BOOT] First boot detected. Initializing Auth NVS.\n");
+    Serial.println("[BOOT] First boot detected. Initializing Auth NVS.");
     preferences.putBool("is_setup", false);
     preferences.putString("pin", DEFAULT_PIN);
   }
@@ -2389,8 +2141,8 @@ void setup() {
   if (savedDisc.isEmpty() && savedCloud.length() > 0) {
     g_discoveryUrl = deriveDiscoveryUrl(g_cloudUrl);
   }
-  LOGI("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
-  LOGI("[BOOT] Cloud alerting: %s (key %s)\n",
+  Serial.printf("[BOOT] Discovery server: %s\n", g_discoveryUrl.c_str());
+  Serial.printf("[BOOT] Cloud alerting: %s (key %s)\n",
                 g_cloudUrl.isEmpty() ? "(none)" : g_cloudUrl.c_str(),
                 g_cloudKey.isEmpty() ? "unset" : "set");
 
@@ -2398,11 +2150,11 @@ void setup() {
     // Do NOT auto-connect here. Wi-Fi is brought up only when the C6 signals
     // GW_ROLE LEADER (this unit is the active gateway). This prevents multiple
     // units from all claiming the uplink. The C6 re-signals role every ~10s.
-    LOGI("[BOOT] Wi-Fi creds present (SSID: %s). Waiting for GW_ROLE from Commissioner...\n",
+    Serial.printf("[BOOT] Wi-Fi creds present (SSID: %s). Waiting for GW_ROLE from Commissioner...\n",
                   SSID_LOG(savedSSID.c_str()));
   }
 
-  LOGI("[BOOT] free heap: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("[BOOT] free heap: %u bytes\n", ESP.getFreeHeap());
 #if BRIDGE_ENABLE_TWDT
   // Widen the Arduino default 5s TWDT and subscribe the loop task, so a true
   // hang (not just low memory) also auto-recovers. OTA brackets this in loop().
@@ -2413,7 +2165,7 @@ void setup() {
   };
   esp_task_wdt_reconfigure(&twdt);
   esp_task_wdt_add(NULL);
-  LOGI("[BOOT] task watchdog armed (%ds).\n", BRIDGE_TWDT_TIMEOUT_S);
+  Serial.printf("[BOOT] task watchdog armed (%ds).\n", BRIDGE_TWDT_TIMEOUT_S);
 #endif
 }
 
@@ -2431,37 +2183,16 @@ void loop() {
     if (!resetBtnPressed) {
       resetBtnPressed = true;
       resetBtnPressTime = millis();
-      LOGW("[SYSTEM] Reset button pressed. Hold for 1s to factory reset...\n");
+      Serial.println("[SYSTEM] Reset button pressed. Hold for 1s to factory reset...");
     } else if (millis() - resetBtnPressTime >= 10000) {
       doFactoryReset();   // wipe C3 + C6 and reboot (does not return)
     }
   } else {
     if (resetBtnPressed) {
-      const uint32_t held = millis() - resetBtnPressTime;
-      resetBtnPressed = false;
-      // A SHORT press is now a deliberate action rather than just an aborted
-      // reset: it opens the management BLE window. Debounced at 50ms so contact
-      // bounce on release cannot open it on its own.
-      if (held >= 50) {
-        LOGI("[SYSTEM] Button released after %lums -- opening BLE window.\n",
-             (unsigned long)held);
-        bleOpenWindow();
-      }
+      resetBtnPressed = false;  // Reset the timer if released early
+      Serial.println("[SYSTEM] Reset button released. Reset aborted.");
     }
   }
-
-  // Remote request collected on the last mesh post (dashboard "Open BLE").
-  // Same effect as a short button press -- both routes exist on purpose: the
-  // button is the only one that works once this unit is off the network.
-  if (g_pendingBleWindow) {
-    g_pendingBleWindow = false;
-    LOGI("[BLE] Window requested from the dashboard.\n");
-    bleOpenWindow();
-  }
-
-  // Close the window once it expires with nobody connected. Cheap to call every
-  // loop: updateBleAdvertising() only acts on an actual state change.
-  updateBleAdvertising();
 
   static char lineBuf[UART_MAX_LINE_LEN];
   static size_t lineLen = 0;
@@ -2484,7 +2215,7 @@ void loop() {
   // 0c. Scheduled fleet OTA (staggered) — run in loop() (single Serial1 owner).
   if (g_fleetOtaPending && (int32_t)(millis() - g_fleetOtaAt) >= 0) {
     g_fleetOtaPending = false;
-    LOGI("[FLEETOTA] starting self-update...\n");
+    Serial.println("[FLEETOTA] starting self-update...");
     performFleetOta(g_fleetOtaBaseUrl);
   }
 #if BRIDGE_ENABLE_TWDT
@@ -2505,33 +2236,19 @@ void loop() {
     int what = g_pendingReboot;
     g_pendingReboot = 0;
     if (what == 2 || what == 3) {
-      LOGI("[SYSTEM] Restarting C6 (dashboard request)...\n");
+      Serial.println("[SYSTEM] Restarting C6 (dashboard request)...");
       Serial1.println("reboot");
       Serial1.flush();
       delay(200);              // let the C6 read the line before we go
     }
     if (what == 1 || what == 3) safeReboot("dashboard restart request");
-    LOGI("[SYSTEM] C6 restart sent; C3 staying up.\n");
+    Serial.println("[SYSTEM] C6 restart sent; C3 staying up.");
   }
 
   // 0e. Wi-Fi scan requested over BLE (blocking) — run here, notify the result.
   if (g_pendingScan) {
-    // A scan sweeps every channel and monopolises the radio. Running one while
-    // an association is still being negotiated aborts that handshake inside the
-    // driver. Hold the request until the attempt settles -- but never longer
-    // than the association timeout, or a phone asking for a network list while
-    // the AP is unreachable would wait forever.
-    const uint32_t nowMs = millis();
-    if (g_pendingScanSince == 0) g_pendingScanSince = nowMs;
-    const bool connecting = g_wifiConnectStartedMs != 0 &&
-                            WiFi.status() != WL_CONNECTED &&
-                            nowMs - g_wifiConnectStartedMs < 12000;
-    if (!connecting || nowMs - g_pendingScanSince >= 15000) {
-      if (connecting) blog("wifi.scan forced (assoc still pending)");
-      g_pendingScan = false;
-      g_pendingScanSince = 0;
-      doWifiScan();
-    }
+    g_pendingScan = false;
+    doWifiScan();
   }
 
   // 0f. Relay a captured boot crash report to the C6 (which tags our EUI and
@@ -2553,13 +2270,13 @@ void loop() {
   if (switchState == HIGH && !isCommissionerMode) {
     isCommissionerMode = true;
 
-    LOGI("[MODE] Switch ON -> Enter SETUP/COMMISSIONER Mode\n");
+    Serial.println("[MODE] Switch ON -> Enter SETUP/COMMISSIONER Mode");
     updateBleAdvertising();   // advertises if fresh/unprovisioned (or already gateway)
     Serial1.println("commissioner_start");
   } else if (switchState == LOW && isCommissionerMode) {
     isCommissionerMode = false;
 
-    LOGI("[MODE] Switch OFF -> Enter SECURE Mode\n");
+    Serial.println("[MODE] Switch OFF -> Enter SECURE Mode");
     updateBleAdvertising();   // keeps BLE up only if this unit is the active gateway
     Serial1.println("commissioner_stop");
   }
@@ -2577,12 +2294,11 @@ void loop() {
       lineBuf[lineLen] = '\0';
       String line(lineBuf);
 
-#if BRIDGE_LOG_LEVEL >= BRIDGE_LOG_VERBOSE
-      LOGV("[UART Rx] %s\n", lineBuf);              // firehose: every C6 line
-#else
-      if (isNotableC6Line(line))
-        LOGI("[C6] %s\n", lineBuf);                 // signal only: warn/error/joiner/net
-#endif
+      if (BRIDGE_VERBOSE) {
+        Serial.printf("[UART Rx] %s\n", lineBuf);     // firehose
+      } else if (isNotableC6Line(line)) {
+        Serial.printf("[C6] %s\n", lineBuf);          // quiet: signal only
+      }
       handleCommissionerLine(line);
 
       lineLen = 0;
@@ -2592,7 +2308,7 @@ void loop() {
         lineBuf[lineLen++] = (char)ch;
 
       } else {
-        LOGE("[UART] Overflow dropped\n");
+        Serial.println("[UART] Overflow dropped");
         lineLen = 0;
       }
     }
@@ -2603,14 +2319,8 @@ void loop() {
   if (standbyPending && (millis() - standbyPendingSince >= STANDBY_GRACE_MS)) {
     standbyPending = false;
     isActiveGateway = false;
-    LOGI("[GW] STANDBY confirmed — dropping Wi-Fi + management BLE (no longer the gateway).\n");
-    blog("gw.standby drop st=%d", (int)WiFi.status());
-    WiFi.disconnect(true);       // deliberate here: a standby router powers the radio down
-    // We just dropped the link on purpose. Clearing the cooldown means a
-    // STANDBY -> LEADER flap (Thread leadership moving back within the 30s
-    // window) reconnects immediately, instead of sitting uplink-less waiting out
-    // a timer armed by a retry we no longer care about.
-    g_lastWifiRetry = 0;
+    Serial.println("[GW] STANDBY confirmed — dropping Wi-Fi + management BLE (no longer the gateway).");
+    WiFi.disconnect(true);
     updateBleAdvertising();   // stop advertising; this unit is now a plain router
   }
 
@@ -2625,17 +2335,10 @@ void loop() {
       if (g_discFails < 2 && now - g_lastBeat >= BEAT_INTERVAL_MS) { g_lastBeat = now; heartbeatPresence(); }
       if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
       if (now - g_lastOtaPoll  >= OTA_POLL_INTERVAL_MS) { g_lastOtaPoll = now;  pollOtaJob(); }
-    } else {
-      // Auto-reconnect is off (see applyWifi), so the uplink comes back only if
-      // we ask for it. GW_ROLE used to be the sole trigger; if the C6 goes quiet
-      // that never arrives and the gateway stays dark. Retry from here too --
-      // same cooldown, so the two paths cannot stack.
-      wifiRetryIfDown("loop.gw");
-      if (now - g_lastWifiWarn >= WIFI_WARN_INTERVAL_MS) {
-        g_lastWifiWarn = now;   // at most once/min, not every discover cycle
-        LOGW("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
-                      WiFi.status());
-      }
+    } else if (now - g_lastWifiWarn >= WIFI_WARN_INTERVAL_MS) {
+      g_lastWifiWarn = now;   // at most once/min, not every discover cycle
+      Serial.printf("[GW] active gateway but Wi-Fi NOT connected (status=%d) — not forwarding\n",
+                    WiFi.status());
     }
   }
 
@@ -2645,7 +2348,7 @@ void loop() {
   if (g_pendingAdd && (int32_t)(millis() - g_pendingDeadlineMs) >= 0) {
     bleNotifyLine("ERR ADD TIMEOUT");
 
-    LOGW("[PROTO] Timed out waiting for JOINER_ADDED\n");
+    Serial.println("[PROTO] Timed out waiting for JOINER_ADDED");
     g_pendingAdd = false;
   }
 
@@ -2669,9 +2372,9 @@ void loop() {
                       String(data.gas,         2);
 
     if (logger.log(dateStr + "," + timeStr + "," + dataLine)) {
-        LOGD("[SD] logged %s %s\n", dateStr.c_str(), timeStr.c_str());
+        if (BRIDGE_VERBOSE) Serial.println("Logged: " + dateStr + " " + timeStr);
     } else {
-        LOGE("[SD] log write FAILED\n");
+        Serial.println("Log Failed");   // keep failures
     }
 
     // Feature 1: forward this BME sample toward the gateway/cloud over the mesh.
@@ -2680,7 +2383,7 @@ void loop() {
     if (c6OnNetwork && millis() - g_lastEnvSend >= ENV_SEND_INTERVAL_MS) {
       g_lastEnvSend = millis();
       Serial1.printf("ENV %s\n", dataLine.c_str());      // "ENV <t>,<h>,<p>,<voc>"
-      LOGD("[ENV->C6] %s (gw=%d)\n", dataLine.c_str(), isActiveGateway);  // debug
+      Serial.printf("[ENV->C6] %s (gw=%d)\n", dataLine.c_str(), isActiveGateway);  // debug
     }
 }
 
