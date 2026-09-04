@@ -36,7 +36,7 @@ static const char *CLOUD_ROOT_CA = "";
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest. Publishing a build without bumping it means the
 // fleet politely refuses the update and reports itself up-to-date.
-#define BRIDGE_FW_VERSION 25
+#define BRIDGE_FW_VERSION 26
 
 // --- Logging ----------------------------------------------------------------
 // Severity levels with compile-time filtering: the standard embedded shape, and
@@ -154,14 +154,6 @@ NimBLECharacteristic *pCharacteristic = nullptr;
 Preferences preferences;
 
 volatile bool bleClientConnected = false;
-// --- On-demand management BLE ----------------------------------------------
-// millis() until which BLE stays up after a short button press; 0 = closed.
-// See bleShouldAdvertise() for why the gateway no longer advertises forever.
-static uint32_t g_bleWindowUntil = 0;
-// Set when the cloud asks for a BLE window; actioned in loop(), not in the HTTP
-// call that collected it.
-static volatile bool g_pendingBleWindow = false;
-static const uint32_t BLE_WINDOW_MS = 5UL * 60UL * 1000UL;
 volatile bool bleClientSecured = false;        // OS-Level Encryption (Just Works)
 volatile bool isSessionAuthenticated = false;  // App-Level Authentication
 
@@ -909,28 +901,6 @@ static void updateUplinkLed() {
   } else {
     on = true;                               // gateway + cloud up: solid
   }
-  // BLE is OVERLAID on the uplink state, not substituted for it. There is only
-  // one LED, and blanking the uplink status for the five minutes BLE is open
-  // would hide the cloud going down during exactly the window when someone is
-  // stood at the unit trying to fix something.
-  //
-  // Each cycle opens with two forced pulses and a forced dark gap, readable
-  // whatever the underlying state including solid. The REST of the cycle is the
-  // normal uplink indication, so one LED carries both facts:
-  //
-  //   blip-blip then solid     gateway + cloud up, BLE open
-  //   blip-blip then blinking  cloud unreachable, BLE open
-  //   blip-blip then dark      standby / no uplink, BLE open
-  //
-  // The cycle shortens once an app connects, so it also confirms the pairing
-  // worked without opening the app.
-  if (bleStackUp) {
-    const uint32_t period = bleClientConnected ? 700 : 1500;
-    const uint32_t t = now % period;
-    if (t < 90 || (t >= 220 && t < 310)) on = true;        // the two pulses
-    else if (t < 400) on = false;                          // gap, so they read
-  }
-
   digitalWrite(UPLINK_LED_PIN, on ? HIGH : LOW);
 }
 
@@ -1145,11 +1115,6 @@ static void forwardMeshCloud() {
     DynamicJsonDocument rdoc(256);
     if (!deserializeJson(rdoc, resp)) {
       String what = String((const char *)(rdoc["reboot"] | ""));
-      // Remote "open the BLE window", the dashboard equivalent of a short
-      // button press. Queued like a restart rather than acted on here: this
-      // runs inside an HTTP call, and bringing the BLE stack up from here would
-      // reconfigure the shared radio underneath the socket we are still using.
-      if ((int)(rdoc["ble"] | 0) == 1) g_pendingBleWindow = true;
       if (what.length()) {
         // Queue it; rebooting inside an HTTP call would strand the socket and
         // the WDT bracket in loop() expects to own restarts (see g_pendingReset).
@@ -2103,38 +2068,8 @@ void configureBLE() {
 // Only the ACTIVE gateway (Thread Leader) advertises for management, so the app
 // sees a single device. A unit not yet on a network advertises only when placed
 // in setup mode (switch), so a fresh unit can still be provisioned.
-// When management BLE should be up.
-//
-// The gateway used to advertise permanently, so BLE and Wi-Fi contended for the
-// C3's single 2.4 GHz radio every second of every day. Eight panics across five
-// firmware versions have ALL landed in the Wi-Fi MAC's transmit-completion path
-// (lmac_record_txtime <- lmacTxDone), every one of them on a pointer that had
-// lost its top byte -- the signature of a word being read while something else
-// wrote it. Coexistence arbitration is the last thing still interleaving with
-// that path that we have not taken away.
-//
-// So BLE is now ON DEMAND: a short press of the reset button opens a 5-minute
-// window, and it stays up beyond that for as long as an app is connected.
-//
-// Two cases still advertise unconditionally, and must:
-//   - a fresh or unprovisioned unit, or there would be no way to commission it;
-//   - a live client, so an in-progress session is never cut off mid-write.
 static bool bleShouldAdvertise() {
-  if (isCommissionerMode && !c6OnNetwork) return true;   // must stay reachable
-  if (bleClientConnected) return true;                   // don't drop a session
-  // Signed compare so the window survives the millis() rollover at 49.7 days.
-  return g_bleWindowUntil != 0 &&
-         (int32_t)(millis() - g_bleWindowUntil) < 0;
-}
-
-// Open the on-demand BLE window (short press of the reset button).
-static void bleOpenWindow() {
-  g_bleWindowUntil = millis() + BLE_WINDOW_MS;
-  if (g_bleWindowUntil == 0) g_bleWindowUntil = 1;   // 0 is the "closed" sentinel
-  blog("ble.window open");
-  LOGI("[BLE] Management window open for %lus -- connect from the app now.\n",
-       (unsigned long)(BLE_WINDOW_MS / 1000));
-  updateBleAdvertising();
+  return isActiveGateway || (isCommissionerMode && !c6OnNetwork);
 }
 
 static void updateBleAdvertising() {
@@ -2437,31 +2372,10 @@ void loop() {
     }
   } else {
     if (resetBtnPressed) {
-      const uint32_t held = millis() - resetBtnPressTime;
-      resetBtnPressed = false;
-      // A SHORT press is now a deliberate action rather than just an aborted
-      // reset: it opens the management BLE window. Debounced at 50ms so contact
-      // bounce on release cannot open it on its own.
-      if (held >= 50) {
-        LOGI("[SYSTEM] Button released after %lums -- opening BLE window.\n",
-             (unsigned long)held);
-        bleOpenWindow();
-      }
+      resetBtnPressed = false;  // Reset the timer if released early
+      LOGI("[SYSTEM] Reset button released. Reset aborted.\n");
     }
   }
-
-  // Remote request collected on the last mesh post (dashboard "Open BLE").
-  // Same effect as a short button press -- both routes exist on purpose: the
-  // button is the only one that works once this unit is off the network.
-  if (g_pendingBleWindow) {
-    g_pendingBleWindow = false;
-    LOGI("[BLE] Window requested from the dashboard.\n");
-    bleOpenWindow();
-  }
-
-  // Close the window once it expires with nobody connected. Cheap to call every
-  // loop: updateBleAdvertising() only acts on an actual state change.
-  updateBleAdvertising();
 
   static char lineBuf[UART_MAX_LINE_LEN];
   static size_t lineLen = 0;
