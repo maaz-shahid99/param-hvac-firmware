@@ -36,7 +36,7 @@ static const char *CLOUD_ROOT_CA = "";
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest. Publishing a build without bumping it means the
 // fleet politely refuses the update and reports itself up-to-date.
-#define BRIDGE_FW_VERSION 26
+#define BRIDGE_FW_VERSION 27
 
 // --- Logging ----------------------------------------------------------------
 // Severity levels with compile-time filtering: the standard embedded shape, and
@@ -222,6 +222,72 @@ static void wifiDisableModemSleep() {
   wifi_ps_type_t ps = WIFI_PS_NONE;
   if (esp_wifi_get_ps(&ps) == ESP_OK && ps != WIFI_PS_NONE)
     LOGW("[WIFI] modem sleep STILL ON (ps=%d) -- power-save disable did not take\n", (int)ps);
+}
+
+
+// --- v27 experiment: stop the FTM transmit-timestamp hook from running -------
+//
+// Every panic on this unit that we can map to a build faults on the SAME
+// instruction: the halfword load at lmac_record_txtime+0x16. Disassembling the
+// libpp.a that ships with core 3.3.8 says what that function is -- the FTM
+// (Fine Timing Measurement, 802.11mc ranging) transmit-timestamp hook. Given
+// the descriptor of a frame that has just finished transmitting, it walks
+//
+//     hdr = *(uint32_t *)( *(uint32_t *)(desc + 4) + 4 );
+//     if ((hdr[0] & 0xf0) == 0xd0 && ...)      <-- the faulting load
+//
+// to decide whether the frame was an FTM Action frame, and returns for anything
+// else. mtval is always that hdr pointer with its top byte cleared, which is why
+// the address tracks the heap: it is a frame buffer.
+//
+// lmacTxDone only calls the hook when bit 3 of the low word of
+// wifi_init_config_t.feature_caps is set -- WIFI_FTM_RESPONDER. Verified
+// against this exact library: ftm_is_responder_supported() tests the same word
+// and the same bit, ftm_is_initiator_supported() tests bit 2, and the remaining
+// readers of that word are the WPA3, 11R, GCMP and enterprise checks.
+//
+// We are a plain station on a campus AP. We never initiate FTM and never respond
+// to it. The hook runs on every frame we transmit purely because the Arduino C3
+// sdkconfig ships CONFIG_ESP_WIFI_FTM_RESPONDER_SUPPORT=y, and it is the ONLY
+// reader of the field that keeps arriving torn -- nothing on the buffer-recycle
+// path touches it, which is why heap poisoning (light, enabled in this build)
+// never fires and the heap always looks clean.
+//
+// So: remove the reader. If the panics stop, the fault was never in the frames
+// we send, only in who was inspecting them afterwards.
+//
+// g_wifi_menuconfig is the Wi-Fi blob's own copy of the init config, filled in
+// by esp_wifi_init(). Offset 64 is the low word of feature_caps -- confirmed by
+// objdump against THIS library only. Re-check it before carrying this forward to
+// any other core version: a silent write to the wrong offset would corrupt an
+// unrelated setting with no visible symptom.
+// Declared as uint32_t, not uint8_t: a byte array carries alignment 1, so the
+// compiler splits the read-modify-write into four byte accesses. This word is
+// read by the Wi-Fi task, and a non-atomic write to it is exactly the class of
+// bug this firmware is chasing. uint32_t forces a single lw/sw pair.
+extern "C" uint32_t g_wifi_menuconfig[];
+
+#define FTM_CAP_BITS  0x0Cu   // WIFI_FTM_INITIATOR (1<<2) | WIFI_FTM_RESPONDER (1<<3)
+
+static bool g_ftmCapsCleared = false;
+
+static void wifiDropFtmCaps() {
+  if (g_ftmCapsCleared) return;   // esp_wifi_init() runs once, so this needs to too
+  uint32_t *caps = &g_wifi_menuconfig[16];   // byte offset 64 / 4
+  const uint32_t before = *caps;
+  // Bits already clear means either the driver is not up yet or the offset is
+  // wrong. Change nothing and say so: a wrong write is far worse than a failed
+  // experiment, and the next connect will try again.
+  if ((before & FTM_CAP_BITS) == 0) {
+    LOGW("[WIFI] feature_caps=0x%08x -- FTM bits not set, not writing (driver not up, or wrong offset)\n",
+         (unsigned)before);
+    return;
+  }
+  *caps = before & ~FTM_CAP_BITS;
+  g_ftmCapsCleared = true;
+  LOGI("[WIFI] feature_caps 0x%08x -> 0x%08x (FTM tx-time hook disabled)\n",
+       (unsigned)before, (unsigned)*caps);
+  blog("ftm.off");   // once only -- the breadcrumb ring is a time budget
 }
 
 // --- Discovery / data-forwarding to the display node ---
@@ -514,6 +580,7 @@ void handleProvisioning(const String &jsonPayload) {
   // the next crash report if that is what we were doing.
   blog("prov.wifi ble-task st=%d", (int)WiFi.status());
   WiFi.mode(WIFI_STA);
+  wifiDropFtmCaps();   // before the first frame goes out; see the note above
   WiFi.setAutoReconnect(false);   // we own reconnection; see applyWifi()
   WiFi.disconnect(false, true);   // disassociate + clear stored AP, radio stays up
   delay(100);
@@ -591,6 +658,7 @@ static void applyWifi(const String &ssid, const String &pass) {
   // single most useful thing the next crash report can carry.
   blog("wifi.apply st=%d heap=%u", (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
+  wifiDropFtmCaps();   // before the first frame goes out; see the note above
 
   // Own the reconnect policy. The Arduino core re-associates by itself
   // (_autoReconnect defaults to true, STA.cpp), which means the core's network
