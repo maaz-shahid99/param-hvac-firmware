@@ -36,7 +36,7 @@ static const char *CLOUD_ROOT_CA = "";
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest. Publishing a build without bumping it means the
 // fleet politely refuses the update and reports itself up-to-date.
-#define BRIDGE_FW_VERSION 27
+#define BRIDGE_FW_VERSION 28
 
 // --- Logging ----------------------------------------------------------------
 // Severity levels with compile-time filtering: the standard embedded shape, and
@@ -288,6 +288,60 @@ static void wifiDropFtmCaps() {
   LOGI("[WIFI] feature_caps 0x%08x -> 0x%08x (FTM tx-time hook disabled)\n",
        (unsigned)before, (unsigned)*caps);
   blog("ftm.off");   // once only -- the breadcrumb ring is a time budget
+}
+
+
+// --- v28 experiment: take 802.11n aggregation out of the TX-done path -------
+//
+// What v27 proved: clearing the FTM capability bits stopped lmac_record_txtime
+// from running, and the panic did not stop -- it MOVED, to pp_coex_tx_release,
+// which reads the very same field through the very same pointer chain:
+//
+//     lw a5,4(a0) ; lw a5,4(a5) ; <byte or halfword load> 0(a5)
+//
+// Two independent consumers, one corrupt word. So the frame-buffer pointer
+// inside the completed TX descriptor is already wrong before anybody reads it.
+// Removing readers one at a time is whack-a-mole, and the readers are in a
+// binary blob we cannot patch. Confirmed by disassembly that this code is byte
+// for byte identical in core 3.3.8 and 3.3.11, so a newer library is not a fix
+// either.
+//
+// So stop removing readers and remove the machinery that owns the descriptors.
+// Block-ack aggregation (A-MPDU) is an 802.11n feature: with 11n off the driver
+// never aggregates, and ppProcTxDone retires one plain frame at a time instead
+// of walking a batch of descriptors whose lifetimes are managed by the
+// aggregation and reorder logic. That batching is the most plausible remaining
+// source of a descriptor being read after it was recycled.
+//
+// The cost is a 54 Mbps link ceiling. This gateway posts a few hundred bytes of
+// JSON every 30 seconds, so it is free.
+//
+// Called right after WiFi.mode() has brought the driver up and before we
+// associate, and re-applied on every connect for the same reason modem sleep is
+// -- a driver re-init would otherwise silently restore the default bitmap and
+// make a failed experiment look like a disproved theory.
+static bool g_11nOff = false;
+
+static void wifiDisable11n() {
+  const uint8_t want = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G;   // no 11N => no A-MPDU
+  esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA, want);
+  if (e != ESP_OK) {
+    LOGW("[WIFI] could not drop 11n: %s\n", esp_err_to_name(e));
+    return;
+  }
+  // Read it back. A setting that silently failed to apply is indistinguishable
+  // from "the theory was wrong", and that is the one confusion this experiment
+  // cannot afford.
+  uint8_t got = 0;
+  if (esp_wifi_get_protocol(WIFI_IF_STA, &got) == ESP_OK) {
+    if (got & WIFI_PROTOCOL_11N) {
+      LOGW("[WIFI] 11n STILL ON (bitmap=0x%02x) -- aggregation not disabled\n",
+           (unsigned)got);
+      return;
+    }
+    LOGI("[WIFI] 11n/AMPDU disabled (bitmap=0x%02x)\n", (unsigned)got);
+  }
+  if (!g_11nOff) { g_11nOff = true; blog("11n.off"); }   // once -- the ring is a time budget
 }
 
 // --- Discovery / data-forwarding to the display node ---
@@ -581,6 +635,7 @@ void handleProvisioning(const String &jsonPayload) {
   blog("prov.wifi ble-task st=%d", (int)WiFi.status());
   WiFi.mode(WIFI_STA);
   wifiDropFtmCaps();   // before the first frame goes out; see the note above
+  wifiDisable11n();    // and no A-MPDU on the tx-done path; see the note above
   WiFi.setAutoReconnect(false);   // we own reconnection; see applyWifi()
   WiFi.disconnect(false, true);   // disassociate + clear stored AP, radio stays up
   delay(100);
@@ -659,6 +714,7 @@ static void applyWifi(const String &ssid, const String &pass) {
   blog("wifi.apply st=%d heap=%u", (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
   WiFi.mode(WIFI_STA);
   wifiDropFtmCaps();   // before the first frame goes out; see the note above
+  wifiDisable11n();    // and no A-MPDU on the tx-done path; see the note above
 
   // Own the reconnect policy. The Arduino core re-associates by itself
   // (_autoReconnect defaults to true, STA.cpp), which means the core's network
