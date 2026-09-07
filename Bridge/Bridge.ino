@@ -36,7 +36,7 @@ static const char *CLOUD_ROOT_CA = "";
 // Bump this on every C3 build you publish; OTA only applies a STRICTLY newer
 // c3_version from the manifest. Publishing a build without bumping it means the
 // fleet politely refuses the update and reports itself up-to-date.
-#define BRIDGE_FW_VERSION 28
+#define BRIDGE_FW_VERSION 29
 
 // --- Logging ----------------------------------------------------------------
 // Severity levels with compile-time filtering: the standard embedded shape, and
@@ -185,6 +185,23 @@ static const uint32_t STANDBY_GRACE_MS = 30000;
 // BLE management endpoint gating: only the ACTIVE gateway (Thread Leader) — or a
 // not-yet-networked unit in setup mode — advertises, so the app sees one device.
 bool c6OnNetwork = false;   // true once the C6 has reported any GW_ROLE (it's a mesh member)
+
+// --- C6 liveness -----------------------------------------------------------
+// The C6 carries the entire Thread mesh, and until now nothing checked whether
+// it was still running. If it panics it reboots and (with v17) reports itself;
+// but if it HANGS it reports nothing, the mesh simply goes quiet, and from the
+// cloud that is indistinguishable from every sensor failing at once. We saw
+// exactly that shape on 7 Sep: all three sensors dark together for 139s with no
+// crash record anywhere.
+//
+// The C6 is chatty — role changes, joiner events, sensor relays — so a long
+// silence on the UART is itself the signal. This is deliberately generous: the
+// quietest legitimate stretch is a settled mesh with nothing joining, so the
+// threshold has to sit well above the sensor report cadence to avoid crying
+// wolf. One report per silence, re-armed only after the C6 speaks again.
+static uint32_t g_lastC6LineMs   = 0;
+static bool     g_c6SilenceNoted = false;
+#define C6_SILENCE_MS  120000UL     // 2 min of no UART line at all
 bool bleStackUp  = false;   // whether the NimBLE stack/advertising is currently active
 
 // Forward declarations (definitions live further down)
@@ -1075,6 +1092,47 @@ static void forwardEnvCloud(const String &eui, const String &csv) {
 // gateway runs this. `payload` is "<reset>|<pc>|<bt>[|<detail>]".
 // The 4th field is optional: a router still running older firmware sends three,
 // and must keep working rather than having its report mangled. ---
+// --- Is our C6 still breathing? --------------------------------------------
+// A panicking C6 reboots and (from v17) reports itself through the CRASH relay.
+// A HUNG one reports nothing at all: the mesh goes silent, every sensor appears
+// to fail simultaneously, and no crash record is written anywhere. That is the
+// one failure mode reset-reason reporting structurally cannot see, because the
+// chip never resets.
+//
+// So the C3 watches the UART instead. This report is posted DIRECTLY to the
+// cloud rather than through the usual relay, because the relay runs through the
+// very chip we are reporting as unresponsive.
+static void c6HealthCheck() {
+  if (!isActiveGateway || WiFi.status() != WL_CONNECTED) return;
+  if (g_lastC6LineMs == 0) return;              // nothing heard yet since boot
+  const uint32_t quiet = millis() - g_lastC6LineMs;
+
+  if (quiet < C6_SILENCE_MS) {
+    g_c6SilenceNoted = false;                   // it spoke; re-arm for next time
+    return;
+  }
+  if (g_c6SilenceNoted) return;                 // one report per silence
+  g_c6SilenceNoted = true;
+
+  blog("c6.silent %us", (unsigned)(quiet / 1000));
+  LOGE("[C6] SILENT for %us — reporting as unresponsive\n", (unsigned)(quiet / 1000));
+
+  // Attribute it to the gateway node if we know which one that is, so the row
+  // lines up with the rest of this unit's history rather than floating free.
+  String eui;
+  for (int i = 0; i < SEEN_MAX; i++)
+    if (!g_mesh[i].eui.isEmpty() && g_mesh[i].role == 'G') { eui = g_mesh[i].eui; break; }
+  if (eui.isEmpty()) eui = "c6-unresponsive";
+
+  String detail = "no UART line for " + String(quiet / 1000) + "s; c3 alive, heap=" +
+                  String((unsigned)ESP.getFreeHeap());
+  // reset|pc|bt|detail|fw  — no pc or backtrace: the C6 never crashed as far as
+  // we can tell, it stopped answering, and inventing an address would be worse
+  // than leaving it blank.
+  forwardCrashCloud(eui, "c6_unresponsive|||" + detail + "|c6-v" +
+                         (g_c6Version >= 0 ? String(g_c6Version) : String("?")));
+}
+
 static void forwardCrashCloud(const String &eui, const String &payload) {
   if (g_cloudUrl.isEmpty() || g_cloudKey.isEmpty()) return;
   int p1 = payload.indexOf('|');
@@ -1084,12 +1142,25 @@ static void forwardCrashCloud(const String &eui, const String &payload) {
   String pc = (p1 >= 0 && p2 > p1) ? payload.substring(p1 + 1, p2) : "";
   String bt = (p2 >= 0) ? (p3 > p2 ? payload.substring(p2 + 1, p3)
                                    : payload.substring(p2 + 1)) : "";
-  String detail = (p3 >= 0) ? payload.substring(p3 + 1) : "";
+  int p4 = (p3 >= 0) ? payload.indexOf('|', p3 + 1) : -1;
+  String detail = (p3 >= 0) ? (p4 > p3 ? payload.substring(p3 + 1, p4)
+                                       : payload.substring(p3 + 1)) : "";
+  // OPTIONAL 5th field: the firmware string of whoever actually crashed.
+  //
+  // This used to be hardcoded to this C3's own version, which was fine while the
+  // C3 was the only thing that could report — the C6 merely relays. But the C6
+  // can now report its OWN panics down the same pipe, and stamping those as
+  // "c3-v28" would file a Thread-radio crash under the Wi-Fi firmware and send
+  // the next investigation to entirely the wrong chip. Absent (older C6 builds,
+  // and this C3's own reports) still means us.
+  String fw = (p4 >= 0) ? payload.substring(p4 + 1) : "";
+  if (fw.isEmpty()) fw = "c3-v" + String(BRIDGE_FW_VERSION);
+  fw.replace("\"", "'");
   detail.replace("\"", "'");      // keep the hand-built JSON below well-formed
   bt.replace("\"", "'");
   const String url = g_cloudUrl + "/v1/crashes";
   const String body = String("{\"sensor_id\":\"") + eui + "\",\"reset_reason\":\"" + reset +
-      "\",\"fw\":\"c3-v" + String(BRIDGE_FW_VERSION) + "\",\"pc\":\"" + pc +
+      "\",\"fw\":\"" + fw + "\",\"pc\":\"" + pc +
       "\",\"backtrace\":\"" + bt + "\",\"detail\":\"" + detail + "\"}";
   int code = 0;
   if (g_cloudUrl.startsWith("https://")) {
@@ -2621,6 +2692,7 @@ void loop() {
       if (isNotableC6Line(line))
         LOGI("[C6] %s\n", lineBuf);                 // signal only: warn/error/joiner/net
 #endif
+      g_lastC6LineMs = millis();      // the C6 is alive; see c6HealthCheck()
       handleCommissionerLine(line);
 
       lineLen = 0;
@@ -2662,6 +2734,7 @@ void loop() {
       // so we don't churn a failing connection every 10s.
       if (g_discFails < 2 && now - g_lastBeat >= BEAT_INTERVAL_MS) { g_lastBeat = now; heartbeatPresence(); }
       if (now - g_lastMesh     >= MESH_PUSH_INTERVAL_MS){ g_lastMesh = now;     forwardMeshCloud(); }
+      c6HealthCheck();     // cheap; self-rate-limits to one report per silence
       if (now - g_lastOtaPoll  >= OTA_POLL_INTERVAL_MS) { g_lastOtaPoll = now;  pollOtaJob(); }
     } else {
       // Auto-reconnect is off (see applyWifi), so the uplink comes back only if
